@@ -163,3 +163,77 @@ void matmul_v3(const float *A, const float *B, float *C, int M, int N, int K) {
     matmul_v3_kernel<BLOCK_SIZE, BLOCK_M, BLOCK_N, BLOCK_K><<<grid_size, BLOCK_SIZE>>>(A, B, C, M, N, K);
 }
 
+template <int BLOCK_M, int BLOCK_N, int BLOCK_K, int THREAD_M, int THREAD_N>
+__global__ void matmul_v4_kernel(const float *A, const float *B, float *C, int M, int N, int K) {
+    static_assert(BLOCK_M % THREAD_M == 0);
+    static_assert(BLOCK_N % THREAD_N == 0);
+    constexpr int BLOCK_SIZE = (BLOCK_M * BLOCK_N) / (THREAD_M * THREAD_N);
+    const int tid = threadIdx.x;
+    const int block_id = blockIdx.x;
+
+    const int num_blocks_per_row = cdiv(N, BLOCK_N);
+    const int block_id_m = block_id / num_blocks_per_row;
+    const int block_id_n = block_id % num_blocks_per_row;
+    const int offset_m = block_id_m * BLOCK_M;
+    const int offset_n = block_id_n * BLOCK_N;
+
+    const int num_threads_per_row = BLOCK_N / THREAD_N;
+    const int tile_thread_id_m = tid / num_threads_per_row;
+    const int tile_thread_id_n = tid % num_threads_per_row;
+    const int tile_thread_offset_m = tile_thread_id_m * THREAD_M;
+    const int tile_thread_offset_n = tile_thread_id_n * THREAD_N;
+
+    __shared__ float A_shmem[BLOCK_M][BLOCK_K];
+    __shared__ float B_shmem[BLOCK_K][BLOCK_N];
+    float acc[THREAD_M][THREAD_N] = {0.0f};
+
+    A += offset_m * K;
+    B += offset_n;
+    
+    const float *A_thread_tile = reinterpret_cast<const float *>(A_shmem) + tile_thread_id_m * BLOCK_K;
+    const float *B_thread_tile = reinterpret_cast<const float *>(B_shmem) + tile_thread_id_n;
+    for (int offset_k = 0; offset_k < K; offset_k += BLOCK_K) {
+        load_shmem<BLOCK_SIZE, BLOCK_M, BLOCK_K>(A, K, M - offset_m, K - offset_k, A_shmem, tid);
+        load_shmem<BLOCK_SIZE, BLOCK_K, BLOCK_N>(B, N, K - offset_k, N - offset_n, B_shmem, tid);
+        __syncthreads();
+
+        for (int k = 0; k < BLOCK_K; k++) {
+            float A_reg[THREAD_M];
+            float B_reg[THREAD_N];
+
+            for (int m = 0; m < THREAD_M; m++)
+                A_reg[m] = A_thread_tile[m * BLOCK_K + k];
+
+            for (int n = 0; n < THREAD_N; n++)
+                B_reg[n] = B_thread_tile[k * BLOCK_N + n];
+
+
+            for (int m = 0; m < THREAD_M; m++ ) {
+                for (int n = 0; n < THREAD_N; n++) {
+                    acc[m][n] += A_reg[m] * B_reg[n];
+                }
+            }
+        }
+        __syncthreads();
+
+        A += BLOCK_K;
+        B += BLOCK_K * N;
+    }
+
+    C += (offset_m + tile_thread_offset_m) * N + (offset_n + tile_thread_offset_n);
+
+    for (int m = 0; m < THREAD_M; m++) {
+        for (int n = 0; n < THREAD_N; n++) {
+            if (m < (M - (offset_m + tile_thread_offset_m)) && n < (N - (offset_n + tile_thread_offset_n)))
+                C[m * N + n] = acc[m][n];
+        }
+    }
+}
+
+void matmul_v4(const float *A, const float *B, float *C, int M, int N, int K) {
+  const int BLOCK_M = 128, BLOCK_N = 128, BLOCK_K = 32;
+  const int THREAD_M = 8, THREAD_N = 8;
+  const int BLOCK_SIZE = (BLOCK_M * BLOCK_N) / (THREAD_M * THREAD_N);  // 256
+  const int grid_size = cdiv(M * N, BLOCK_M * BLOCK_N);
+  matmul_v4_kernel<BLOCK_M, BLOCK_N, BLOCK_K, THREAD_M, THREAD_N><<<grid_size, BLOCK_SIZE>>>(A, B, C, M, N, K);
+}
