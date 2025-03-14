@@ -1,20 +1,41 @@
-# cuda_gemm
+# CUDA GEMM - Optimized Matrix Multiplication with CUDA Cores
 
-# Matrix Multiplication - CUDA Cores
+## Overview
 
-Resources:
-- https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#shared-memory
-- https://siboehm.com/articles/22/CUDA-MMM
-- https://leimao.github.io/article/CUDA-Matrix-Multiplication-Optimization/ and https://github.com/leimao/CUDA-GEMM-Optimization/
-- https://github.com/NVIDIA/cutlass/blob/main/media/docs/efficient_gemm.md
+This project explores efficient matrix multiplication using CUDA cores, applying various optimization techniques to improve performance on an NVIDIA A6000 GPU.
 
-All experiments run on A6000
-Lessons learned:
+## Resources
 
-- Hierarchical tiling: block-level (shared memory cache), warp-level, and thread-level (register cache).
-- Vectorized memory access: not sure why it helps as we already use 128-byte memory transaction. Perhaps it reduces number of instructions and thus better pipelining?
-- Reduce memory address computations: increment memory address after each iteration instead of calculating from the base address every time.
-- Avoid bank conflicts:
-  - Padding shared memory (TODO).
-  - Swizzled layout (TODO).
-- Double buffering: use double amount of shared memory, but don't need to `__syncthreads()` after computation code -> better data loading and computation interleaving (TODO).
+For deeper insights into CUDA matrix multiplication optimizations, refer to the following resources:
+
+- [NVIDIA CUDA C Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#shared-memory)
+- [CUDA Matrix Multiplication - An Overview](https://siboehm.com/articles/22/CUDA-MMM)
+- [CUDA Matrix Multiplication Optimization](https://leimao.github.io/article/CUDA-Matrix-Multiplication-Optimization/) and [GitHub Repository](https://github.com/leimao/CUDA-GEMM-Optimization/)
+- [NVIDIA CUTLASS: Efficient GEMM](https://github.com/NVIDIA/cutlass/blob/main/media/docs/efficient_gemm.md)
+
+## Lessons Learned
+
+### 1. Hierarchical Tiling
+- Optimizing memory access at different levels:
+  - **Block-level tiling**: Uses shared memory as a cache.
+  - **Warp-level tiling**: Improves data reuse within warps.
+  - **Thread-level tiling**: Leverages register memory for reduced memory latency.
+
+### 2. Vectorized Memory Access
+- **Observation**: Even though 128-byte memory transactions are already used, vectorized access seems to improve performance.
+- **Possible Reason**: Reduced instruction count enables better instruction pipelining.
+
+### 3. Reducing Memory Address Computation
+- Instead of recalculating addresses in every iteration, **increment addresses** to reduce computational overhead.
+
+### 4. Avoiding Bank Conflicts
+- **Padding shared memory** to prevent conflicts (**TODO**).
+- **Swizzled layout** to optimize memory access patterns (**TODO**).
+
+### 5. Double Buffering
+- Uses **twice the shared memory** to overlap data loading and computation.
+- Eliminates the need for `__syncthreads()` after each computation phase, improving performance through better interleaving (**TODO**).
+
+---
+
+This README provides a structured and professional explanation of your project while maintaining technical depth. 🚀
