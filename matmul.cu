@@ -1,6 +1,7 @@
 #include <cmath>
 #include <stdio.h>
 #include <assert.h>
+#include <stdlib.h>
 
 __host__ __device__ constexpr int cdiv(int a, int b) { return (a + b - 1) / b; }
 constexpr bool is_power_of_two(int x) { return x > 0 && (x & (x - 1)) == 0; }  // https://stackoverflow.com/a/1804686
@@ -451,33 +452,33 @@ __global__ void matmul_v6_kernel(const float *A, const float *B, float *C, int M
         __syncthreads();
 
         for (int k = 0; k < BLOCK_K; k++) {
-        float A_reg[NUM_MMA_M][THREAD_M];
-        float B_reg[NUM_MMA_N][THREAD_N];
+            float A_reg[NUM_MMA_M][THREAD_M];
+            float B_reg[NUM_MMA_N][THREAD_N];
 
-        for (int mma_tile_id_m = 0; mma_tile_id_m < NUM_MMA_M; mma_tile_id_m++)
-            if (TRANSPOSE_A_shmem) {
-            static_assert(THREAD_M % 4 == 0);
-            for (int tm = 0; tm < THREAD_M; tm += 4) {
-                float4 tmp = reinterpret_cast<const float4 *>(&A_thread_tile[k * BLOCK_M + (mma_tile_id_m * MMA_M + tm)])[0];
-                reinterpret_cast<float4 *>(&A_reg[mma_tile_id_m][tm])[0] = tmp;
-            }
-            }
-            else {
-            for (int tm = 0; tm < THREAD_M; tm++)
-                A_reg[mma_tile_id_m][tm] = A_thread_tile[(mma_tile_id_m * MMA_M + tm) * BLOCK_K + k];
-            }
+            for (int mma_tile_id_m = 0; mma_tile_id_m < NUM_MMA_M; mma_tile_id_m++)
+                if (TRANSPOSE_A_shmem) {
+                    static_assert(THREAD_M % 4 == 0);
+                    for (int tm = 0; tm < THREAD_M; tm += 4) {
+                        float4 tmp = reinterpret_cast<const float4 *>(&A_thread_tile[k * BLOCK_M + (mma_tile_id_m * MMA_M + tm)])[0];
+                        reinterpret_cast<float4 *>(&A_reg[mma_tile_id_m][tm])[0] = tmp;
+                    }
+                }
+                else {
+                    for (int tm = 0; tm < THREAD_M; tm++)
+                        A_reg[mma_tile_id_m][tm] = A_thread_tile[(mma_tile_id_m * MMA_M + tm) * BLOCK_K + k];
+                }
 
-        for (int mma_tile_id_n = 0; mma_tile_id_n < NUM_MMA_N; mma_tile_id_n++)
-            for (int tn = 0; tn < THREAD_N; tn += 4) {
-            float4 tmp = reinterpret_cast<const float4 *>(&B_thread_tile[k * BLOCK_N + (mma_tile_id_n * MMA_N + tn)])[0];
-            reinterpret_cast<float4 *>(&B_reg[mma_tile_id_n][tn])[0] = tmp;
-            }
-
-        for (int mma_tile_id_m = 0; mma_tile_id_m < NUM_MMA_M; mma_tile_id_m++)
             for (int mma_tile_id_n = 0; mma_tile_id_n < NUM_MMA_N; mma_tile_id_n++)
-            for (int tm = 0; tm < THREAD_M; tm++)
-                for (int tn = 0; tn < THREAD_N; tn++)
-                acc[mma_tile_id_m][mma_tile_id_n][tm][tn] += A_reg[mma_tile_id_m][tm] * B_reg[mma_tile_id_n][tn];
+                for (int tn = 0; tn < THREAD_N; tn += 4) {
+                    float4 tmp = reinterpret_cast<const float4 *>(&B_thread_tile[k * BLOCK_N + (mma_tile_id_n * MMA_N + tn)])[0];
+                    reinterpret_cast<float4 *>(&B_reg[mma_tile_id_n][tn])[0] = tmp;
+                }
+
+            for (int mma_tile_id_m = 0; mma_tile_id_m < NUM_MMA_M; mma_tile_id_m++)
+                for (int mma_tile_id_n = 0; mma_tile_id_n < NUM_MMA_N; mma_tile_id_n++)
+                    for (int tm = 0; tm < THREAD_M; tm++)
+                        for (int tn = 0; tn < THREAD_N; tn++)
+                            acc[mma_tile_id_m][mma_tile_id_n][tm][tn] += A_reg[mma_tile_id_m][tm] * B_reg[mma_tile_id_n][tn];
         }
         __syncthreads();
 
