@@ -8,17 +8,17 @@ This project explores efficient matrix multiplication using CUDA cores, applying
 
 The table below summarizes the kernel performance for a 4096×4096 matrix multiplication. Each kernel's runtime (in milliseconds) is converted to TFLOPS, where 1 TFLOPS equals 1,000 GFLOPS. The TFLOPS values are calculated based on the total floating-point operations (FLOPs) required for the operation, which for this matrix size is approximately 137.44 billion FLOPs.
 
-| Kernel         | Time (ms) | TFLOPS       |
-|----------------|-----------|--------------|
-| **CuBLAS**     | 5.82246   | 23.61 TFLOPS |
-| **triton ref** | 7.67590   | 17.91 TFLOPS |
-| **v1**         | 58.74278  | 2.34 TFLOPS  |
-| **v2**         | 46.35136  | 2.964 TFLOPS |
-| **v3**         | 41.86112  | 3.284 TFLOPS |
-| **v4**         | 10.33114  | 13.297 TFLOPS|
-| **v5**         | 10.16422  | 13.528 TFLOPS|
-| **v6a**        | 7.12704   | 19.293 TFLOPS|
-| **v6b**        | 6.82086   | 20.148 TFLOPS|
+| Kernel | Time (ms) | TFLOPS | % cublas |
+|----------------|-----------|--------------|---------|
+| **CuBLAS** | 5.82246 | 23.61 TFLOPS | 100% |
+| **triton ref** | 7.67590 | 17.91 TFLOPS | 75.86% |
+| **v1** | 58.74278 | 2.34 TFLOPS | 9.91% |
+| **v2** | 46.35136 | 2.964 TFLOPS | 12.55% |
+| **v3** | 41.86112 | 3.284 TFLOPS | 13.91% |
+| **v4** | 10.33114 | 13.297 TFLOPS | 56.32% |
+| **v5** | 10.16422 | 13.528 TFLOPS | 57.30% |
+| **v6a** | 7.12704 | 19.293 TFLOPS | 81.72% |
+| **v6b** | 6.82086 | 20.148 TFLOPS | 85.34% |
 
 ### How the Numbers Were Calculated
 
