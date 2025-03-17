@@ -93,39 +93,39 @@ __global__ void matmul_v1_kernel(const T *A, const T *B, T *C, int M, int N, int
         __syncthreads();
 
         for (int warp_k = 0; warp_k < BLOCK_K; warp_k += WARP_K) {
-        // load data from shared memory to registers using ldmatrix
-        // https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-ldmatrix
+            // load data from shared memory to registers using ldmatrix
+            // https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-ldmatrix
 
-        // convert generic address to .shared state space address expected by inline PTX
-        // thread 0 holds address of row 0
-        // thread 1 holds address of row 1, and so on
-        uint32_t A_tile_addr = cvta_shared(A_warp_tile + lane_id * A_shared_width + warp_k);
-        uint32_t B_tile_addr = cvta_shared(B_warp_tile + lane_id * B_shared_width + warp_k);
+            // convert generic address to .shared state space address expected by inline PTX
+            // thread 0 holds address of row 0
+            // thread 1 holds address of row 1, and so on
+            uint32_t A_tile_addr = cvta_shared(A_warp_tile + lane_id * A_shared_width + warp_k);
+            uint32_t B_tile_addr = cvta_shared(B_warp_tile + lane_id * B_shared_width + warp_k);
 
-        // load A to registers
-        // ldmatrix can only load 8x8 matrix. for 16x8 tile, we need to use x2
-        // works for both m16n8k8 and m16n8k16
-        for (int mma_tile_id_m = 0; mma_tile_id_m < NUM_MMA_M; mma_tile_id_m++)
-            for (int mma_tile_id_k = 0; mma_tile_id_k < NUM_MMA_K; mma_tile_id_k++) {
-            uint32_t A_local = A_tile_addr + (mma_tile_id_m * MMA_M * A_shared_width + mma_tile_id_k * MMA_K) * sizeof(T);
-            ldmatrix<num_A_regs>(A_reg[mma_tile_id_m][mma_tile_id_k], A_local);
-            }
+            // load A to registers
+            // ldmatrix can only load 8x8 matrix. for 16x8 tile, we need to use x2
+            // works for both m16n8k8 and m16n8k16
+            for (int mma_tile_id_m = 0; mma_tile_id_m < NUM_MMA_M; mma_tile_id_m++)
+                for (int mma_tile_id_k = 0; mma_tile_id_k < NUM_MMA_K; mma_tile_id_k++) {
+                uint32_t A_local = A_tile_addr + (mma_tile_id_m * MMA_M * A_shared_width + mma_tile_id_k * MMA_K) * sizeof(T);
+                ldmatrix<num_A_regs>(A_reg[mma_tile_id_m][mma_tile_id_k], A_local);
+                }
 
-        // load B to registers
-        for (int mma_tile_id_n = 0; mma_tile_id_n < NUM_MMA_N; mma_tile_id_n++)
-            for (int mma_tile_id_k = 0; mma_tile_id_k < NUM_MMA_K; mma_tile_id_k++) {
-            uint32_t B_local = B_tile_addr + (mma_tile_id_n * MMA_N * B_shared_width + mma_tile_id_k * MMA_K) * sizeof(T);
-            ldmatrix<num_B_regs>(B_reg[mma_tile_id_n][mma_tile_id_k], B_local);
-            }
-
-        // call mma
-        // https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-1688
-        for (int mma_tile_id_m = 0; mma_tile_id_m < NUM_MMA_M; mma_tile_id_m++)
+            // load B to registers
             for (int mma_tile_id_n = 0; mma_tile_id_n < NUM_MMA_N; mma_tile_id_n++)
-            for (int mma_tile_id_k = 0; mma_tile_id_k < NUM_MMA_K; mma_tile_id_k++)
-                mma<MMA_M, MMA_N, MMA_K, T>(A_reg[mma_tile_id_m][mma_tile_id_k],
-                                            B_reg[mma_tile_id_n][mma_tile_id_k],
-                                            acc[mma_tile_id_m][mma_tile_id_n]);
+                for (int mma_tile_id_k = 0; mma_tile_id_k < NUM_MMA_K; mma_tile_id_k++) {
+                uint32_t B_local = B_tile_addr + (mma_tile_id_n * MMA_N * B_shared_width + mma_tile_id_k * MMA_K) * sizeof(T);
+                ldmatrix<num_B_regs>(B_reg[mma_tile_id_n][mma_tile_id_k], B_local);
+                }
+
+            // call mma
+            // https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-1688
+            for (int mma_tile_id_m = 0; mma_tile_id_m < NUM_MMA_M; mma_tile_id_m++)
+                for (int mma_tile_id_n = 0; mma_tile_id_n < NUM_MMA_N; mma_tile_id_n++)
+                for (int mma_tile_id_k = 0; mma_tile_id_k < NUM_MMA_K; mma_tile_id_k++)
+                    mma<MMA_M, MMA_N, MMA_K, T>(A_reg[mma_tile_id_m][mma_tile_id_k],
+                                                B_reg[mma_tile_id_n][mma_tile_id_k],
+                                                acc[mma_tile_id_m][mma_tile_id_n]);
         }
         __syncthreads();
 
