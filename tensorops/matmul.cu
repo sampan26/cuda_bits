@@ -77,8 +77,8 @@ __global__ void matmul_v1_kernel(const T *A, const T *B, T *C, int M, int N, int
 
     // 32-bit (4-byte) registers
     constexpr int num_acc_regs = MMA_M * MMA_N / WARP_SIZE;
-    constexpr int num_A_regs = MMA_M * MMA_K * sizeof(T) / 4 / WARP_SIZE;
-    constexpr int num_B_regs = MMA_N * MMA_K * sizeof(T) / 4 / WARP_SIZE;
+    constexpr int num_A_regs = MMA_M * MMA_K * sizeof(T) / 4 / WARP_SIZE;    //2
+    constexpr int num_B_regs = MMA_N * MMA_K * sizeof(T) / 4 / WARP_SIZE;    //1
     float acc[NUM_MMA_M][NUM_MMA_N][num_acc_regs] = {0.0f};  // for m16n8k8, each thread holds 4 output float
     uint32_t A_reg[NUM_MMA_M][NUM_MMA_K][num_A_regs];        //              each thread holds 2 input f16x2
     uint32_t B_reg[NUM_MMA_N][NUM_MMA_K][num_B_regs];        //              each thread holds 1 input f16x1
@@ -107,24 +107,24 @@ __global__ void matmul_v1_kernel(const T *A, const T *B, T *C, int M, int N, int
             // works for both m16n8k8 and m16n8k16
             for (int mma_tile_id_m = 0; mma_tile_id_m < NUM_MMA_M; mma_tile_id_m++)
                 for (int mma_tile_id_k = 0; mma_tile_id_k < NUM_MMA_K; mma_tile_id_k++) {
-                uint32_t A_local = A_tile_addr + (mma_tile_id_m * MMA_M * A_shared_width + mma_tile_id_k * MMA_K) * sizeof(T);
-                ldmatrix<num_A_regs>(A_reg[mma_tile_id_m][mma_tile_id_k], A_local);
+                    uint32_t A_local = A_tile_addr + (mma_tile_id_m * MMA_M * A_shared_width + mma_tile_id_k * MMA_K) * sizeof(T);
+                    ldmatrix<num_A_regs>(A_reg[mma_tile_id_m][mma_tile_id_k], A_local);
                 }
 
             // load B to registers
             for (int mma_tile_id_n = 0; mma_tile_id_n < NUM_MMA_N; mma_tile_id_n++)
                 for (int mma_tile_id_k = 0; mma_tile_id_k < NUM_MMA_K; mma_tile_id_k++) {
-                uint32_t B_local = B_tile_addr + (mma_tile_id_n * MMA_N * B_shared_width + mma_tile_id_k * MMA_K) * sizeof(T);
-                ldmatrix<num_B_regs>(B_reg[mma_tile_id_n][mma_tile_id_k], B_local);
+                    uint32_t B_local = B_tile_addr + (mma_tile_id_n * MMA_N * B_shared_width + mma_tile_id_k * MMA_K) * sizeof(T);
+                    ldmatrix<num_B_regs>(B_reg[mma_tile_id_n][mma_tile_id_k], B_local);
                 }
 
             // call mma
             // https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-1688
             for (int mma_tile_id_m = 0; mma_tile_id_m < NUM_MMA_M; mma_tile_id_m++)
                 for (int mma_tile_id_n = 0; mma_tile_id_n < NUM_MMA_N; mma_tile_id_n++)
-                for (int mma_tile_id_k = 0; mma_tile_id_k < NUM_MMA_K; mma_tile_id_k++)
-                    mma<MMA_M, MMA_N, MMA_K, T>(A_reg[mma_tile_id_m][mma_tile_id_k],
-                                                B_reg[mma_tile_id_n][mma_tile_id_k],
+                    for (int mma_tile_id_k = 0; mma_tile_id_k < NUM_MMA_K; mma_tile_id_k++)
+                        mma<MMA_M, MMA_N, MMA_K, T>(A_reg[mma_tile_id_m][mma_tile_id_k],
+                                                    B_reg[mma_tile_id_n][mma_tile_id_k],
                                                 acc[mma_tile_id_m][mma_tile_id_n]);
         }
         __syncthreads();
@@ -146,19 +146,19 @@ __global__ void matmul_v1_kernel(const T *A, const T *B, T *C, int M, int N, int
 
     for (int mma_tile_id_m = 0; mma_tile_id_m < NUM_MMA_M; mma_tile_id_m++)
         for (int mma_tile_id_n = 0; mma_tile_id_n < NUM_MMA_N; mma_tile_id_n++) {
-        T *C_local = C + mma_tile_id_m * MMA_M * N + mma_tile_id_n * MMA_N;
-        float *acc_frag = acc[mma_tile_id_m][mma_tile_id_n];
-        ushort2 tmp;
+            T *C_local = C + mma_tile_id_m * MMA_M * N + mma_tile_id_n * MMA_N;
+            float *acc_frag = acc[mma_tile_id_m][mma_tile_id_n];
+            ushort2 tmp;
 
-        // write a0 and a1
-        tmp.x = f32_to_b16<T>(acc_frag[0]);
-        tmp.y = f32_to_b16<T>(acc_frag[1]);
-        reinterpret_cast<ushort2 *>(C_local)[0] = tmp;
+            // write a0 and a1
+            tmp.x = f32_to_b16<T>(acc_frag[0]);
+            tmp.y = f32_to_b16<T>(acc_frag[1]);
+            reinterpret_cast<ushort2 *>(C_local)[0] = tmp;
 
-        // write a2 and a3
-        tmp.x = f32_to_b16<T>(acc_frag[2]);
-        tmp.y = f32_to_b16<T>(acc_frag[3]);
-        reinterpret_cast<ushort2 *>(C_local + 8 * N)[0] = tmp;
+            // write a2 and a3
+            tmp.x = f32_to_b16<T>(acc_frag[2]);
+            tmp.y = f32_to_b16<T>(acc_frag[3]);
+            reinterpret_cast<ushort2 *>(C_local + 8 * N)[0] = tmp;
         }
 }
 
