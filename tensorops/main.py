@@ -28,3 +28,5 @@ torch.testing.assert_close(output_v1b, output_ref)
 print("CuBLAS:", benchmark(torch.matmul, input1, input2))
 print("v1a:", benchmark(module.matmul_v1a, input1, input2))
 print("v1b:", benchmark(module.matmul_v1b, input1, input2))
+
+

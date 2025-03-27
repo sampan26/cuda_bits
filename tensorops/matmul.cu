@@ -173,7 +173,8 @@ void matmul_v1a(const nv_bfloat16 *A, const nv_bfloat16 *B, nv_bfloat16 *C, int 
 
     const int BLOCK_SIZE = (BLOCK_M * BLOCK_N) / (WARP_M * WARP_N) * WARP_SIZE;
     const int grid_size = cdiv(M * N, BLOCK_M * BLOCK_N);
-    matmul_v1_kernel<
+    matmul_v1_kernel
+    <
         BLOCK_M, BLOCK_N, BLOCK_K,
         WARP_M, WARP_N, WARP_K,
         MMA_M, MMA_N, MMA_K,
