@@ -18,6 +18,9 @@ MatmulFn matmul_v2b;
 MatmulFn matmul_v3a;
 MatmulFn matmul_v3b;
 
+MatmulFn matmul_v4a;
+MatmulFn matmul_v4b;
+
 template <MatmulFn matmul_fn> torch::Tensor matmul_pt(torch::Tensor A, torch::Tensor B) {
   CHECK_INPUT(A);
   CHECK_INPUT(B.t());
@@ -41,4 +44,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("matmul_v2b", &matmul_pt<matmul_v2b>, "Matrix multiplication v2b");
   m.def("matmul_v3a", &matmul_pt<matmul_v3a>, "Matrix multiplication v3a");
   m.def("matmul_v3b", &matmul_pt<matmul_v3b>, "Matrix multiplication v3b");
+  m.def("matmul_v4a", &matmul_pt<matmul_v4a>, "Matrix multiplication v4a");
+  m.def("matmul_v4b", &matmul_pt<matmul_v4b>, "Matrix multiplication v4b");
 }
