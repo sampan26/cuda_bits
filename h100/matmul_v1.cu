@@ -1,17 +1,5 @@
 #include <cmath>
-#include <stdio.h>
-#include <assert.h>
-#include <stdlib.h>
-#include <cuda_bf16.h>
-#include "cublas_v2.h"
-
-
-__host__ __device__ constexpr int cdiv(int a, int b) { return (a + b - 1) / b; }
-constexpr bool is_power_of_two(int x) { return x > 0 && (x & (x - 1)) == 0; }  // https://stackoverflow.com/a/1804686
-
-template <typename T> __device__ ushort f32_to_b16(float x);
-template <> __device__ ushort f32_to_b16<half>(float x) { return __half_as_ushort(__float2half(x)); }
-template <> __device__ ushort f32_to_b16<nv_bfloat16>(float x) { return __bfloat16_as_ushort(__float2bfloat16(x)); }
+#include "utils.cuh"
 
 constexpr int WARP_SIZE = 32;
 
