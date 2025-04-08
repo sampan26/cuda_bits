@@ -9,6 +9,7 @@
 typedef void SoftmaxFn(const float *input, float *out, int M, int N);
 
 SoftmaxFn softmax_v1;
+SoftmaxFn softmax_v2;
 
 template <SoftmaxFn softmax_fn> torch::Tensor softmax_pt(torch::Tensor A) {
     CHECK_INPUT(A);
@@ -21,4 +22,5 @@ template <SoftmaxFn softmax_fn> torch::Tensor softmax_pt(torch::Tensor A) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("softmax_v1", &softmax_pt<softmax_v1>, "Softmax v1");
+    m.def("softmax_v2", &softmax_pt<softmax_v2>, "Online softmax");
 }

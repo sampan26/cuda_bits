@@ -16,9 +16,11 @@ input = torch.randn(1024, 32768).cuda()
 
 output_ref = torch.softmax(input, dim=-1)
 output_v1 = module.softmax_v1(input)
+output_v2 = module.softmax_v2(input)
 
 torch.testing.assert_close(output_v1, output_ref)
 
 print("CuBLAS:", benchmark(torch.softmax, input, dim=-1))
 print("v1:", benchmark(module.softmax_v1, input))
+print("v2:", benchmark(module.softmax_v2, input))
 
