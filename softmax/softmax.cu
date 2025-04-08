@@ -56,3 +56,63 @@ void softmax_v2(const float* input, float* output, int M, int N) {
     int grid_size = cdiv(M, BLOCK_SIZE);
     softmax_kernel_v2<<<grid_size, BLOCK_SIZE>>>(input, output, M, N);
 }
+
+__global__ void softmax_kernel_v3(const float*  input, float*  out, int M, int N) {
+    __shared__ float smem[1024];
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    if (row >= M) return;
+
+ 
+    input += row * N;
+    out += row * N;
+    float local_max = -INFINITY;
+    float local_norm = 0.0f;
+
+    for (int i = tid; i < N; i += blockDim.x) {
+        float x = input[i];
+        if (x > local_max) {
+            local_norm *= expf(local_max - x);
+            local_max = x;
+        }
+        local_norm += expf(x - local_max);
+    }
+
+    smem[tid] = local_max;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            smem[tid] = max(smem[tid], smem[tid + stride]);
+        }
+        __syncthreads();
+    }
+
+    float row_max = smem[0];
+
+    smem[tid] = local_norm * expf(local_max - row_max);
+    __syncthreads();
+
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[tid] += smem[tid + stride];
+        }
+        __syncthreads();
+    }
+    float row_norm = smem[0];
+
+
+
+    for (int i = tid; i < N; i += blockDim.x) {
+        out[i] = expf(input[i] - row_max) / row_norm;
+    }
+}
+
+void softmax_v3(const float* input, float* output, int M, int N) {
+    const int BLOCK_SIZE = 1024;
+    int grid_size = M;
+    softmax_kernel_v3<<<grid_size, BLOCK_SIZE>>>(input, output, M, N);
+}

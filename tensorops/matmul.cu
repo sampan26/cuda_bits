@@ -694,13 +694,13 @@ __global__ void matmul_v4_kernel(const T *A, const T *B, T *C, int M, int N, int
                 // --- Load Next (k+1) into reg_load_idx buffer ---
                 #pragma unroll
                 for (int mma_m = 0; mma_m < NUM_MMA_M; ++mma_m) {
-                        uint32_t A_local_addr = cvta_shared(A_warp_tile + (mma_m * MMA_M + lane_id) * A_shared_width + next_k_offset_in_warp);
-                        ldmatrix<num_A_regs>(A_reg[reg_load_idx][mma_m], A_local_addr);
+                    uint32_t A_local_addr = cvta_shared(A_warp_tile + (mma_m * MMA_M + lane_id) * A_shared_width + next_k_offset_in_warp);
+                    ldmatrix<num_A_regs>(A_reg[reg_load_idx][mma_m], A_local_addr);
                 }
                 #pragma unroll
                 for (int mma_n = 0; mma_n < NUM_MMA_N; ++mma_n) {
-                        uint32_t B_local_addr = cvta_shared(B_warp_tile + (mma_n * MMA_N + lane_id) * B_shared_width + next_k_offset_in_warp);
-                        ldmatrix<num_B_regs>(B_reg[reg_load_idx][mma_n], B_local_addr);
+                    uint32_t B_local_addr = cvta_shared(B_warp_tile + (mma_n * MMA_N + lane_id) * B_shared_width + next_k_offset_in_warp);
+                    ldmatrix<num_B_regs>(B_reg[reg_load_idx][mma_n], B_local_addr);
                 }
 
                 // --- Compute Current (k) using data from reg_compute_idx buffer ---
