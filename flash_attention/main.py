@@ -35,10 +35,10 @@ v = torch.randn(B, n_heads, T, head_dim, dtype=dtype, device=device, requires_gr
 output_ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
 output_v1 = module.flashattn_v1(q, k, v)
 
-torch.testing.assert_close(output_v1, output_ref,rtol=5, atol=2)
+torch.testing.assert_close(output_v1, output_ref)
 
 
 print("Manual Attention Masking:", benchmark(manual_attention_masking, q, k, v))
-print("Pytorch Flash attention:", benchmark(torch.nn.functional.scaled_dot_product_attention, q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), is_causal=True))
+print("Pytorch Flash attention:", benchmark(torch.nn.functional.scaled_dot_product_attention, q, k, v, is_causal=True))
 print("v1:", benchmark(module.flashattn_v1, q, k, v))
 
