@@ -8,7 +8,7 @@ def benchmark(f, *args, **kwargs):
 
 module = torch.utils.cpp_extension.load(
     "module",
-    sources=["flashattention_v1.cu", "flash_attention.cpp"],
+    sources=["flashattention_v1.cu", "flashattention_v2.cu", "flashattention_v3.cu", "flashattention_v4.cu",  "flash_attention.cpp"],
     extra_cuda_cflags=["-O3", "--use_fast_math", "--ptxas-options=-v", "-allow-unsupported-compiler"],
     verbose=True,
 )
@@ -22,8 +22,8 @@ def manual_attention_masking(q, k, v):
     y = attn @ v
     return y
 
-B, n_heads = 32, 6
-T, head_dim = 1024, 128
+B, n_heads = 64, 12
+T, head_dim = 1024, 64
 
 dtype = torch.float32
 device = 'cuda'
@@ -34,11 +34,22 @@ v = torch.randn(B, n_heads, T, head_dim, dtype=dtype, device=device, requires_gr
 
 output_ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
 output_v1 = module.flashattn_v1(q, k, v)
+output_v2 = module.flashattn_v2(q, k, v)
+output_v3 = module.flashattn_v3(q, k, v)
+output_v4 = module.flashattn_v4(q, k, v)
+
 
 torch.testing.assert_close(output_v1, output_ref)
+torch.testing.assert_close(output_v2, output_ref)
+torch.testing.assert_close(output_v3, output_ref)
+
 
 
 print("Manual Attention Masking:", benchmark(manual_attention_masking, q, k, v))
 print("Pytorch Flash attention:", benchmark(torch.nn.functional.scaled_dot_product_attention, q, k, v, is_causal=True))
 print("v1:", benchmark(module.flashattn_v1, q, k, v))
+print("v2:", benchmark(module.flashattn_v2, q, k, v))
+print("v3:", benchmark(module.flashattn_v3, q, k, v))
+print("v4:", benchmark(module.flashattn_v4, q, k, v))
+
 

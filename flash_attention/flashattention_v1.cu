@@ -2,8 +2,6 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 
-#include "flashattention_v1.h"
-
 __host__ __device__ inline constexpr int cdiv(int a, int b) { return (a + b - 1) / b; }
 
 template<int BLOCK_SIZE, int Br, int Bc> 
@@ -140,9 +138,9 @@ bool check_shared_memory_requirements(size_t required_shared_mem) {
 void flashattn_v1(const float *Q, const float *K, const float *V, float *O,
                   float *l, float *m, 
                   int B, int nh, int T, int d) {
-    const int Bc =16; const int Br = 16;
+    const int Bc = 32; const int Br = 32;
     const float scale = 1.0 / sqrt(d);
-    const int sram_size = (3 * Bc * d * sizeof(float)) + (Bc * Br * sizeof(float));
+    const int sram_size = (2 * Bc * d * sizeof(float)) + (Br * d * sizeof(float)) + (Bc * Br * sizeof(float));
     
     if (!check_shared_memory_requirements(sram_size)) {
         printf("Not enough shared memory");
