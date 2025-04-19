@@ -3,6 +3,7 @@
 #include <stdio.h>
 
 constexpr int WARP_SIZE = 32;
+constexpr int d = 64;
 
 __host__ __device__ inline constexpr int cdiv(int a, int b) { return (a + b - 1) / b; }
 
@@ -12,165 +13,121 @@ __global__ void flashattn_kernel_v3(
     const float *K, //  [B, nh, T, head_dim]
     const float *V, //  [B, nh, T, head_dim]
     float *__restrict__ O, //  [B, nh, T, head_dim]
-    float *l, // norm intermediate [B, nh, T]
-    float *m, // Row max intermediate [B, nh, T]
-    int B, int nh, int T, int d, 
+    int B, int nh, int T, 
     float scale // Scale factor (usually 1/sqrt(head_dim))
-) {
-    const int warps_per_block = BLOCK_SIZE / WARP_SIZE;
-    
-    const int tid = threadIdx.x;
-    const int lane_id = tid % WARP_SIZE;
-    const int warp_id = tid / WARP_SIZE;
-    
-    const int batch_id = blockIdx.x;
-    const int head_id = blockIdx.y;
+) { 
+    int tid = threadIdx.x;
+    int batch_head_id = blockIdx.x;
+    int i = blockIdx.y;
 
-    const int Tc = cdiv(T, Bc); 
-    const int Tr = cdiv(T, Br);
+    int s_row = tid / Bc;
+    int s_col = tid % Bc;
 
-    const int QKV_head_offset = batch_id * (nh * T * d) + head_id * (T * d);
-    const int lm_head_offset = batch_id * (nh * T) + head_id * T;
+    const int Tc = cdiv(T, Bc); const int Tr = cdiv(T, Br);
 
-    extern __shared__ float smem[];
-    float* Q_smem = smem;
-    float* K_smem = &smem[Br * d];
-    float* V_smem = &smem[Br * d + Bc * d];
-    float* S_smem = &smem[Br * d + 2 * Bc * d];  // Bc * Br
-    
-    // Process tiles
+    const int KV_head_offset = batch_head_id * T * d;
+    const int Q_head_offset = KV_head_offset + i * Br * d;
+
+    int num_tiles_kv = cdiv(d, Br);
+    int num_tiles_q = cdiv(d, Bc);
+
+    __shared__ float Q_smem[Br * d];
+    __shared__ float K_smem[Bc * d];
+    __shared__ float V_smem[Bc * d];
+    __shared__ float S_ij_smem[Br * Bc];
+
+    float O_i[2];
+    for (int i = 0; i < num_tiles_q; i++) {
+        O_i[i] = 0.0f;
+    }
+
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    // Load Q and O tiles into shared memory
+    for (int x = 0; x < num_tiles_q; ++x) {
+        int idx = x * (Br * Bc) + tid;
+        int q_row = idx / d;
+        int q_col = idx % d; 
+        Q_smem[q_row * d + q_col] = Q[Q_head_offset + q_row * d + q_col];
+    }
+    __syncthreads();
+
     for (int j = 0; j < Tc; ++j) {
-        const int KV_tile_offset = QKV_head_offset + j * Bc * d;
-        
-        // Collaborative loading of K and V tiles using all threads
-        for (int idx = tid; idx < Bc * d; idx += BLOCK_SIZE) {
-            const int col = idx / d;
-            const int feature = idx % d;
-            K_smem[idx] = K[KV_tile_offset + col * d + feature];
-            V_smem[idx] = V[KV_tile_offset + col * d + feature];
+        // Load K and V tiles into shared memory
+        for (int x = 0; x < num_tiles_kv; ++x) {
+            int idx = x * (Bc * Br) + tid;
+            int kv_row = idx / d;
+            int kv_col = idx % d;
+            K_smem[kv_row * d + kv_col] = K[KV_head_offset + (j * Bc + kv_row) * d + kv_col];
+            V_smem[kv_row * d + kv_col] = V[KV_head_offset + (j * Bc + kv_row) * d + kv_col];
         }
+        
         __syncthreads();
 
-        // Process blocks row by row
-        for (int i = j; i < Tr; ++i) {
-            const int Q_tile_offset = QKV_head_offset + i * Br * d;
-            const int lm_tile_offset = lm_head_offset + i * Br;
-            
-            // Collaborative loading of Q tile
-            for (int idx = tid; idx < Br * d; idx += BLOCK_SIZE) {
-                const int row = idx / d;
-                const int feature = idx % d;
-                Q_smem[idx] = Q[Q_tile_offset + row * d + feature];
-            }
-            __syncthreads();
-            
-            // Each thread processes one or more rows
-            for (int row = warp_id; row < Br; row += warps_per_block) {
-                float m_i = m[lm_tile_offset + row];
-                float l_i = l[lm_tile_offset + row];
-                
-                // Compute scores for this row
-                float m_ij = -INFINITY;
-                
-                // Each thread in warp computes partial dot products
-                for (int col = 0; col < Bc; ++col) {                    
-                    // Apply causal masking
-                    
-                    float score = 0.0f;
-                    // Vectorized dot product within each thread
-                    for (int f = lane_id; f < d; f += WARP_SIZE) {
-                        score += Q_smem[row * d + f] * K_smem[col * d + f];
-                    }
-                    
-                    // Warp reduction for dot product
-                    for (int offset = WARP_SIZE/2; offset > 0; offset /= 2) {
-                        score += __shfl_down_sync(0xffffffff, score, offset);
-                    }
-                    
-                    // First thread in warp has final score
-                    if (lane_id == 0) {
-                        score *= scale;
-                        S_smem[row * Bc + col] = score;
-                        m_ij = max(m_ij, score);
-                    }
-                }
-                
-                // Broadcast max score to all threads in warp
-                m_ij = __shfl_sync(0xffffffff, m_ij, 0);
-                
-                // Compute softmax normalization and update l_ij
-                float l_ij = 0.0f;
-                
-                for (int col = lane_id; col < Bc; col += WARP_SIZE) {
-                    if (j * Bc + col >= T) continue;
-                    
-                    // Apply causal masking
-                    if (i * Br + row < j * Bc + col) {
-                        S_smem[row * Bc + col] = 0.0f;
-                    } else {
-                        S_smem[row * Bc + col] = __expf(S_smem[row * Bc + col] - m_ij);
-                        l_ij += S_smem[row * Bc + col];
-                    }
-                }
-                
-                // Warp reduction for l_ij
-                for (int offset = WARP_SIZE/2; offset > 0; offset /= 2) {
-                    l_ij += __shfl_down_sync(0xffffffff, l_ij, offset);
-                }
-                
-                // First thread in warp has final l_ij
-                l_ij = __shfl_sync(0xffffffff, l_ij, 0);
-                
-                // Compute new m and l values
-                float m_new = max(m_i, m_ij);
-                float l_new = __expf(m_i - m_new) * l_i + __expf(m_ij - m_new) * l_ij;
-                
-                float alpha = __expf(m_i - m_new);
-                float beta = __expf(m_ij - m_new) / l_new;
-                
-                // Each thread processes a chunk of the head dimension
-                for (int f = lane_id; f < d; f += WARP_SIZE) {
-                    float PV_acc = 0.0f;
-                    for (int col = 0; col < Bc; ++col) {                        
-                        PV_acc += S_smem[row * Bc + col] * V_smem[col * d + f];
-                    }
-                    O[Q_tile_offset + row * d + f] = alpha * l_i / l_new * O[Q_tile_offset + row * d + f] + beta * PV_acc;
-                }
-                
-                // Update m and l values
-                if (lane_id == 0) {
-                    m[lm_tile_offset + row] = m_new;
-                    l[lm_tile_offset + row] = l_new;
-                }
-                
-            }
-            __syncthreads();
+        float acc = 0.0f;
+        for (int k = 0; k < d; k++) {
+            acc += Q_smem[s_row * d + k] * K_smem[s_col * d + k];
         }
+        acc *= scale;
+
+        int query_pos = i * Br + s_row;
+        int key_pos = j * Bc + s_col;
+        if (key_pos > query_pos) {
+            acc = -INFINITY;
+        }
+            
+        S_ij_smem[s_row * Bc + s_col] = acc;
+        __syncthreads();
+        
+        float m_i = m;
+        float m_ij = m;
+        // Compute row max and softmax
+        for (int k = 0; k < Bc; k++) {
+            float val = S_ij_smem[s_row * Bc + k];
+            if (val > m_ij) {
+                m_ij = val;
+            }
+        }
+        m = m_ij;
+        
+        for (int i = 0; i < num_tiles_q; i++) {
+            O_i[i] *= __expf(m_i - m_ij);
+        }
+        float l_i = __expf(m_i - m_ij) * l;
+        float P_ij;
+        for (int k = 0; k < Bc; k++) {
+            P_ij = __expf(S_ij_smem[s_row * Bc + k] - m);
+            l_i += P_ij;
+            for (int i = 0; i < num_tiles_kv; i++) {
+                O_i[i] += P_ij * V_smem[k * d + (s_col + i * Bc)];
+            }
+        }
+        l = l_i;
         __syncthreads();
     }
-}
 
+    
+    for (int i = 0; i < num_tiles_kv; i++) {
+        O[Q_head_offset + s_row * d + i * Bc + s_col] = O_i[i] / l;
+    }
+} 
 
-
-// Host LAUNCHER function
 void flashattn_v3(const float *Q, const float *K, const float *V, float *O,
                   float *l, float *m, 
                   int B, int nh, int T, int d) {
     const int Bc = 32; const int Br = 32;
-    const int BLOCK_SIZE = 512;
+    const int BLOCK_SIZE = Bc * Br;
+    const float scale = 1.0 / sqrt(d);    
 
-    const float scale = 1.0 / sqrt(d);
-    const int sram_size = (2 * Bc * d * sizeof(float)) + (Br * d * sizeof(float)) + (Bc * Br * sizeof(float));
+    dim3 grid_dim(B * nh, cdiv(T, Br));  // batch_size x num_heads
+    dim3 block_dim(BLOCK_SIZE);
 
-    dim3 grid_dim(B, nh);  // batch_size x num_heads
-
-
-    flashattn_kernel_v3<BLOCK_SIZE, 32, 32><<<grid_dim, BLOCK_SIZE, sram_size>>>(
-        Q, K, V, O, l, m, B, nh, T, d, scale
+    flashattn_kernel_v3<BLOCK_SIZE, Br, Bc><<<grid_dim, block_dim>>>(
+        Q, K, V, O, B, nh, T, scale
     );
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("CUDA Error after kernel launch: %s\n", cudaGetErrorString(err));
-        // Consider throwing an exception
     }
 }
