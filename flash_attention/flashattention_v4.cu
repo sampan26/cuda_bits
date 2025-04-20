@@ -87,7 +87,7 @@ __global__ void flashattn_kernel_v4(
                 for (int mm = 0; mm < TM; ++mm)
                     #pragma unroll
                     for (int nn = 0; nn < TN; ++nn)
-                        acc[mm][nn] += Q_reg[mm] * K_reg[nn] * scale;  
+                        acc[mm][nn] += Q_reg[mm] * K_reg[nn];  
             }
             __syncthreads();
         }
@@ -97,7 +97,7 @@ __global__ void flashattn_kernel_v4(
             int q_pos = i * Br + tile_thread_row_id * TM + mm;
             for (int nn = 0; nn < TN; ++nn) {
                 int k_pos = j * Bc + tile_thread_col_id * TN + nn;
-                float val = (k_pos > q_pos) ? -INFINITY : acc[mm][nn];
+                float val = (k_pos > q_pos) ? -INFINITY : acc[mm][nn] * scale;
                 S_ij_smem[(tile_thread_row_id * TM + mm) * (Bc + 1) + tile_thread_col_id * TN + nn] = val;
             }
         }
