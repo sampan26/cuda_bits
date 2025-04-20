@@ -31,9 +31,9 @@ __global__ void flashattn_kernel_v3(
     int num_tiles_kv = cdiv(d, Br);
     int num_tiles_q = cdiv(d, Bc);
 
-    __shared__ float Q_smem[Br * d];
-    __shared__ float K_smem[Bc * d];
-    __shared__ float V_smem[Bc * d];
+    __shared__ float Q_smem[Br * (d + 1)];
+    __shared__ float K_smem[Bc * (d + 1)];
+    __shared__ float V_smem[Bc * (d + 1)];
     __shared__ float S_ij_smem[Br * Bc];
 
     float O_i[2];
