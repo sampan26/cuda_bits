@@ -3,189 +3,203 @@
 #include <stdio.h>
 
 constexpr int WARP_SIZE = 32;
+constexpr int d = 64;
 
 __host__ __device__ inline constexpr int cdiv(int a, int b) { return (a + b - 1) / b; }
 
-template<int BLOCK_SIZE, int Br, int Bc> 
+template<int BLOCK_SIZE, int Br, int Bc, int Bk, int TM, int TN> 
 __global__ void flashattn_kernel_v4(
-    const float *Q, //  [B, nh, T, head_dim]
-    const float *K, //  [B, nh, T, head_dim]
-    const float *V, //  [B, nh, T, head_dim]
-    float *__restrict__ O, //  [B, nh, T, head_dim]
-    float *l, // norm intermediate [B, nh, T]
-    float *m, // Row max intermediate [B, nh, T]
-    int B, int nh, int T, int d, 
-    float scale // Scale factor (usually 1/sqrt(head_dim))
-) {
-    const int warps_per_block = BLOCK_SIZE / WARP_SIZE; //Q is broken up into 2 16xd loads
-    const int num_regs = 2;  // output 2 elements in 2 different rows
-    
-    const int tid = threadIdx.x;
-    const int lane_id = tid % WARP_SIZE;
-    const int warp_id = tid / WARP_SIZE;
-    
-    const int batch_id = blockIdx.x;
-    const int head_id = blockIdx.y;
+    const float *Q,
+    const float *K,
+    const float *V,
+    float *__restrict__ O,
+    int B, int nh, int T,
+    float scale)
+{
+    static_assert(Br % TM == 0);
+    static_assert(Bc % TN == 0);
 
-    const int Tc = cdiv(T, Bc); 
-    const int Tr = cdiv(T, Br);
+    int tid             = threadIdx.x;
+    int batch_head_id   = blockIdx.x;
+    int i               = blockIdx.y;
 
-    const int QKV_head_offset = batch_id * (nh * T * d) + head_id * (T * d);
-    const int lm_head_offset = batch_id * (nh * T) + head_id * T;
+    const int num_threads_per_row = Bc / TN;         // 8
+    const int tile_thread_row_id  = tid / num_threads_per_row;
+    const int tile_thread_col_id  = tid % num_threads_per_row;
 
-    extern __shared__ __align__(16) float smem[];
-    float* Q_smem = smem;
-    float* K_smem = &smem[Br * d];
-    float* V_smem = &smem[Br * d + Bc * d];
-    float* S_smem = &smem[Br * d + 2 * Bc * d];  // Bc * Br
+    const int Tc        = cdiv(T, Bc);
+    const int num_tiles = d / Bc;                     // 2 for d = 64, Bc = 32
 
-    __shared__ float K_reg_cache[Bc][num_regs * WARP_SIZE]; 
-    
-    // Process tiles
-    for (int j = 0; j < Tc; ++j) {
-        const int KV_tile_offset = QKV_head_offset + j * Bc * d;
+    const int num_threads_per_k_row = BLOCK_SIZE / Bk;
+    const int k_row = tid / Bk;
+    const int k_col = tid % Bk;
+
+    const int KV_head_offset = batch_head_id * T * d;
+    const int Q_head_offset  = KV_head_offset + i * Br * d;
+
+    __shared__ float Q_smem[Br * d];
+    __shared__ float K_smem[Bc * (Bk + 1)];
+    __shared__ float V_smem[Bc * Bk];
+    __shared__ float S_ij_smem[Br * (Bc + 1)];
+
+    float m[TM];
+    float l[TM]  = {0.f};
+    float m_i[TM];
+
+    #pragma unroll
+    for (int ii = 0; ii < TM; ++ii) m[ii] = -INFINITY;
+
+    float Q_reg[TM];
+    float K_reg[TN];
+
+    float O_i[num_tiles][TM * TN] = {0.f};
+
+    for (int idx = tid; idx < d * Br; idx += BLOCK_SIZE) {
+        int q_row = idx / d;
+        int q_col = idx % d;
+        Q_smem[q_row * d + q_col] = Q[Q_head_offset + q_row * d + q_col];
+    }
+    __syncthreads();
+
+    for (int j = 0; j < Tc && j <= i; ++j) {
+        float acc[TM][TN] = {0.f};
+
+        for (int tile = 0; tile < num_tiles; tile++) {
+            int block_k = tile * Bc;
+
+            for (int x = k_row; x < Bc; x += num_threads_per_k_row) {
+                int g_idx = (j * Bc + x) * d + block_k + k_col;
+                K_smem[x * (Bk + 1) + k_col] = K[KV_head_offset + g_idx];
+            }
+            __syncthreads();
+
+            #pragma unroll
+            for (int k = 0; k < Bk; ++k) {
+                #pragma unroll
+                for (int mm = 0; mm < TM; ++mm)
+                    Q_reg[mm] = Q_smem[(tile_thread_row_id * TM + mm) * d + block_k + k];
+
+                #pragma unroll
+                for (int nn = 0; nn < TN; ++nn)
+                    K_reg[nn] = K_smem[(tile_thread_col_id * TN + nn) * (Bk + 1) + k];
+
+                #pragma unroll
+                for (int mm = 0; mm < TM; ++mm)
+                    #pragma unroll
+                    for (int nn = 0; nn < TN; ++nn)
+                        acc[mm][nn] += Q_reg[mm] * K_reg[nn] * scale;  
+            }
+            __syncthreads();
+        }
+
+        #pragma unroll
+        for (int mm = 0; mm < TM; ++mm) {
+            int q_pos = i * Br + tile_thread_row_id * TM + mm;
+            for (int nn = 0; nn < TN; ++nn) {
+                int k_pos = j * Bc + tile_thread_col_id * TN + nn;
+                float val = (k_pos > q_pos) ? -INFINITY : acc[mm][nn];
+                S_ij_smem[(tile_thread_row_id * TM + mm) * (Bc + 1) + tile_thread_col_id * TN + nn] = val;
+            }
+        }
+        __syncthreads();
+
+
+        #pragma unroll
+        for (int mm = 0; mm < TM; ++mm) {
+            float m_ij = m[mm];
+            #pragma unroll
+            for (int k = 0; k < Bc; ++k) {
+                float val = S_ij_smem[(tile_thread_row_id * TM + mm) * (Bc + 1) + k];
+                m_ij = fmaxf(m_ij, val);
+            }
+            m_i[mm] = m[mm];          
+            m[mm]   = m_ij;            
+        }
+
+
+        #pragma unroll
+        for (int tile = 0; tile < num_tiles; ++tile) {
+            #pragma unroll
+            for (int mm = 0; mm < TM; ++mm) {
+                #pragma unroll
+                for (int nn = 0; nn < TN; ++nn) {
+                    O_i[tile][mm * TN + nn] *= __expf(m_i[mm] - m[mm]);
+                }
+            }
+        }
         
-        // Collaborative loading of K and V tiles using all threads
-        for (int idx = tid; idx < Bc * d; idx += BLOCK_SIZE) {
-            const int col = idx / d;
-            const int feature = idx % d;
-            K_smem[idx] = K[KV_tile_offset + col * d + feature];
-            V_smem[idx] = V[KV_tile_offset + col * d + feature];
-        }
+
+        #pragma unroll
+        for (int mm = 0; mm < TM; ++mm)
+            l[mm] *= __expf(m_i[mm] - m[mm]);
         __syncthreads();
 
-        float K_reg[Bc][num_regs];
-         
-        for (int bc_row_id = 0; bc_row_id < Bc; bc_row_id++) {
-            for (int idx = 0; idx < num_regs; idx++) {
-                int f = lane_id + idx * WARP_SIZE;
-                K_reg[bc_row_id][idx] = K_smem[bc_row_id * d + f];
-            }
-        }
-        // Process blocks row by row
-        for (int i = j; i < Tr; ++i) {
-            const int Q_tile_offset = QKV_head_offset + i * Br * d;
-            const int lm_tile_offset = lm_head_offset + i * Br;
-            
-            // Collaborative loading of Q tile
-            for (int idx = tid; idx < Br * d; idx += BLOCK_SIZE) {
-                const int row = idx / d;
-                const int feature = idx % d;
-                Q_smem[idx] = Q[Q_tile_offset + row * d + feature];
+        for (int tile = 0; tile < num_tiles; ++tile) {
+            int block_k = tile * Bc;
+            for (int x = k_row; x < Bc; x += num_threads_per_k_row) {
+                int g_idx = (j * Bc + x) * d + block_k + k_col;
+                if (g_idx < T * d) {
+                    V_smem[x * Bk + k_col] = V[KV_head_offset + g_idx];
+                }
+                else {
+                    V_smem[x * Bk + k_col] = 0.0f;
+                }
             }
             __syncthreads();
-            
-            // Each thread processes one or more rows
-            for (int row = warp_id; row < Br; row += warps_per_block) {
-                float m_i = m[lm_tile_offset + row];
-                float l_i = l[lm_tile_offset + row];
-                
-                float m_ij = -INFINITY;
 
-                float Q_reg[num_regs];
-                for (int idx = 0; idx < num_regs; ++idx) {
-                    int f = lane_id + idx * WARP_SIZE;
-                    if (f < d) {
-                        Q_reg[idx] = Q_smem[row * d + f];
-                    }
+            #pragma unroll
+            for (int k = 0; k < Bc; ++k) {
+                #pragma unroll
+                for (int mm = 0; mm < TM; ++mm) {
+                    Q_reg[mm] = __expf(S_ij_smem[(tile_thread_row_id * TM + mm) * (Bc + 1) + k] - m[mm]);
+                    if (tile == 0)
+                        l[mm] += Q_reg[mm];                               
                 }
-                
-                // Each thread in warp computes partial dot products
-                for (int col = 0; col < Bc; ++col) {                    
-                    float score = 0.0f;
-                    // Vectorized dot product within each thread
-                    for (int idx = 0; idx < num_regs; ++idx) {
-                        score += Q_reg[idx] * K_reg[col][idx];   
-                    }
-                    
-                    // Warp reduction for dot product
-                    for (int offset = WARP_SIZE/2; offset > 0; offset /= 2) {
-                        score += __shfl_down_sync(0xffffffff, score, offset);
-                    }
-                    
-                    // First thread in warp has final score
-                    if (lane_id == 0) {
-                        score *= scale;
-                        S_smem[row * Bc + col] = score;
-                        m_ij = max(m_ij, score);
-                    }
-                }
-                
-                // Broadcast max score to all threads in warp
-                m_ij = __shfl_sync(0xffffffff, m_ij, 0);
-                
-                // Compute softmax normalization and update l_ij
-                float l_ij = 0.0f;
-                
-                for (int col = lane_id; col < Bc; col += WARP_SIZE) {
-                    if (j * Bc + col >= T) continue;
-                    
-                    // Apply causal masking
-                    if (i * Br + row < j * Bc + col) {
-                        S_smem[row * Bc + col] = 0.0f;
-                    } else {
-                        S_smem[row * Bc + col] = __expf(S_smem[row * Bc + col] - m_ij);
-                        l_ij += S_smem[row * Bc + col];
-                    }
-                }
-                
-                // Warp reduction for l_ij
-                for (int offset = WARP_SIZE/2; offset > 0; offset /= 2) {
-                    l_ij += __shfl_down_sync(0xffffffff, l_ij, offset);
-                }
-                
-                // First thread in warp has final l_ij
-                l_ij = __shfl_sync(0xffffffff, l_ij, 0);
-                
-                // Compute new m and l values
-                float m_new = max(m_i, m_ij);
-                float l_new = __expf(m_i - m_new) * l_i + __expf(m_ij - m_new) * l_ij;
-                
-                float alpha = __expf(m_i - m_new);
-                float beta = __expf(m_ij - m_new) / l_new;
-                
-                // Each thread processes a chunk of the head dimension
-                for (int f = lane_id; f < d; f += WARP_SIZE) {
-                    float PV_acc = 0.0f;
-                    for (int col = 0; col < Bc; ++col) {                        
-                        PV_acc += S_smem[row * Bc + col] * V_smem[col * d + f];
-                    }
-                    O[Q_tile_offset + row * d + f] = alpha * l_i / l_new * O[Q_tile_offset + row * d + f] + beta * PV_acc;
-                }
-                
-                // Update m and l values
-                if (lane_id == 0) {
-                    m[lm_tile_offset + row] = m_new;
-                    l[lm_tile_offset + row] = l_new;
-                }
-                
+                #pragma unroll
+                for (int nn = 0; nn < TN; ++nn)
+                    K_reg[nn] = V_smem[k * Bk + tile_thread_col_id * TN + nn];
+
+                #pragma unroll
+                for (int mm = 0; mm < TM; ++mm)
+                    #pragma unroll
+                    for (int nn = 0; nn < TN; ++nn)
+                        O_i[tile][mm * TN + nn] += Q_reg[mm] * K_reg[nn];
             }
             __syncthreads();
         }
-        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int tile = 0; tile < num_tiles; ++tile) {
+        int block_k = tile * Bc;
+        #pragma unroll
+        for (int mm = 0; mm < TM; ++mm)
+            #pragma unroll
+            for (int nn = 0; nn < TN; ++nn) {
+                int out_idx = (tile_thread_row_id * TM + mm) * d +
+                              block_k + tile_thread_col_id * TN + nn;
+                O[Q_head_offset + out_idx] = O_i[tile][mm * TN + nn] / l[mm];
+            }
     }
 }
 
 
-
-// Host LAUNCHER function
 void flashattn_v4(const float *Q, const float *K, const float *V, float *O,
                   float *l, float *m, 
                   int B, int nh, int T, int d) {
-    const int Bc = 32; const int Br = 32;
-    const int BLOCK_SIZE = 512;
+    const int Bc = 32, Br = 32, Bk = 32;
+    const int TM = 4, TN = 4;
+    const int BLOCK_SIZE = Bc * Br / (TM * TN); //  64
+    const float scale = 1.0 / sqrt(d);    
 
-    const float scale = 1.0 / sqrt(d);
-    const int sram_size = (2 * Bc * d * sizeof(float)) + (Br * d * sizeof(float)) + (Bc * Br * sizeof(float));
-    
-    dim3 grid_dim(B, nh);  // batch_size x num_heads
+    dim3 grid_dim(B * nh, cdiv(T, Br));  
+    dim3 block_dim(BLOCK_SIZE);
 
-    flashattn_kernel_v4<BLOCK_SIZE, Br, Bc><<<grid_dim, BLOCK_SIZE, sram_size>>>(
-        Q, K, V, O, l, m, B, nh, T, d, scale
+    flashattn_kernel_v4<BLOCK_SIZE, Br, Bc, Bk, TM, TN><<<grid_dim, block_dim>>>(
+        Q, K, V, O, B, nh, T, scale
     );
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("CUDA Error after kernel launch: %s\n", cudaGetErrorString(err));
-        // Consider throwing an exception
     }
 }

@@ -12,8 +12,9 @@ typedef void FlashAttentionFn(const float *Q, const float *K, const float *V, fl
 FlashAttentionFn flashattn_v1;
 FlashAttentionFn flashattn_v2;
 FlashAttentionFn flashattn_v3;
-// FlashAttentionFn flashattn_v4;
-// FlashAttentionFn flashattn_v5;
+FlashAttentionFn flashattn_v4;
+FlashAttentionFn flashattn_v6;
+FlashAttentionFn flashattn_v5;
 
 
 template <FlashAttentionFn flashattn_fn> torch::Tensor flashattn_pt(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
@@ -43,6 +44,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("flashattn_v1", &flashattn_pt<flashattn_v1>, "Flash Attention v1");
     m.def("flashattn_v2", &flashattn_pt<flashattn_v2>, "Flash Attention v2");
     m.def("flashattn_v3", &flashattn_pt<flashattn_v3>, "Flash Attention v3");
-    // m.def("flashattn_v4", &flashattn_pt<flashattn_v4>, "Flash Attention v4");
-    // m.def("flashattn_v5", &flashattn_pt<flashattn_v5>, "Flash Attention v5");
+    m.def("flashattn_v4", &flashattn_pt<flashattn_v4>, "Flash Attention v4");
+    m.def("flashattn_v6", &flashattn_pt<flashattn_v6>, "Flash Attention v6");
+    m.def("flashattn_v5", &flashattn_pt<flashattn_v5>, "Flash Attention v5");
 }

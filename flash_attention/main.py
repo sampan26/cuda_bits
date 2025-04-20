@@ -8,7 +8,7 @@ def benchmark(f, *args, **kwargs):
 
 module = torch.utils.cpp_extension.load(
     "module",
-    sources=["flashattention_v1.cu", "flashattention_v2.cu", "flashattention_v3.cu", "flashattention_v4.cu",  "flash_attention.cpp"],
+    sources=["flashattention_v1.cu", "flashattention_v2.cu","flashattention_v3.cu", "flashattention_v4.cu","flashattention_v6.cu","flashattention_v5.cu", "flash_attention.cpp"],
     extra_cuda_cflags=["-O3", "--use_fast_math", "--ptxas-options=-v", "-allow-unsupported-compiler"],
     verbose=True,
 )
@@ -37,11 +37,16 @@ output_v1 = module.flashattn_v1(q, k, v)
 output_v2 = module.flashattn_v2(q, k, v)
 output_v3 = module.flashattn_v3(q, k, v)
 output_v4 = module.flashattn_v4(q, k, v)
+output_v6 = module.flashattn_v6(q, k, v)
+# output_v5 = module.flashattn_v5(q, k, v)
 
 
 torch.testing.assert_close(output_v1, output_ref)
 torch.testing.assert_close(output_v2, output_ref)
 torch.testing.assert_close(output_v3, output_ref)
+torch.testing.assert_close(output_v4, output_ref)
+torch.testing.assert_close(output_v6, output_ref)
+# torch.testing.assert_close(output_v5, output_ref)
 
 
 
@@ -51,5 +56,7 @@ print("v1:", benchmark(module.flashattn_v1, q, k, v))
 print("v2:", benchmark(module.flashattn_v2, q, k, v))
 print("v3:", benchmark(module.flashattn_v3, q, k, v))
 print("v4:", benchmark(module.flashattn_v4, q, k, v))
+print("v6:", benchmark(module.flashattn_v6, q, k, v))
+# print("v6:", benchmark(module.flashattn_v5, q, k, v))
 
 
