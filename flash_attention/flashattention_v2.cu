@@ -23,6 +23,10 @@ __global__ void flashattn_kernel_v2(
 
     int s_row = tid / Bc;
     int s_col = tid % Bc;
+    
+    // Register variables for this thread's row statistics
+    float my_m_i = -INFINITY;  // Each thread maintains its own m_i
+    float my_l_i = 0.0f;       // Each thread maintains its own l_i
 
     const int Tc = cdiv(T, Bc); const int Tr = cdiv(T, Br);
 
@@ -37,8 +41,6 @@ __global__ void flashattn_kernel_v2(
     __shared__ float V_smem[Bc * d];
     __shared__ float S_ij_smem[Br * Bc];
     __shared__ float O_smem[Br * d];
-    __shared__ float m_i[Br];
-    __shared__ float l_i[Br];
     __shared__ float m_new[Br];
     __shared__ float l_new[Br];
     __shared__ float m_ij_smem[Br];
@@ -74,12 +76,13 @@ __global__ void flashattn_kernel_v2(
                 }
             }
             __syncthreads();
-            // Load m_i and l_i for current block
-            if (s_col == 0) {
-                m_i[s_row] = m[lm_head_offset + (i * Br) + s_row];
-                l_i[s_row] = l[lm_head_offset + (i * Br) + s_row];
+            
+            // Load m_i and l_i from global memory into registers for this thread's row
+            int global_row = i * Br + s_row;
+            if (global_row < T) {
+                my_m_i = m[lm_head_offset + global_row];
+                my_l_i = l[lm_head_offset + global_row];
             }
-            __syncthreads();
 
             // Compute S_ij = Q_i * K_j^T
             float acc = 0.0f;
@@ -98,31 +101,40 @@ __global__ void flashattn_kernel_v2(
             S_ij_smem[s_row * Bc + s_col] = acc;
             __syncthreads();
 
-            // Compute row max and softmax
+            // Compute row max and softmax - distributed across threads
+            // Each thread handles one element in the row
+            float my_val = S_ij_smem[s_row * Bc + s_col];
+            
+            // Find row maximum using warp shuffle reduction
+            float m_ij = my_val;
+            for (int offset = Bc/2; offset > 0; offset /= 2) {
+                float other_val = __shfl_down_sync(0xFFFFFFFF, m_ij, offset);
+                m_ij = fmaxf(m_ij, other_val);
+            }
+            // Broadcast the max back to all threads in the row
+            m_ij = __shfl_sync(0xFFFFFFFF, m_ij, 0);
+            
+            // Compute exponential and sum
+            float exp_val = __expf(my_val - m_ij);
+            S_ij_smem[s_row * Bc + s_col] = exp_val;
+            
+            // Sum reduction using warp shuffle
+            float l_ij = exp_val;
+            for (int offset = Bc/2; offset > 0; offset /= 2) {
+                l_ij += __shfl_down_sync(0xFFFFFFFF, l_ij, offset);
+            }
+            // Broadcast the sum back to all threads
+            l_ij = __shfl_sync(0xFFFFFFFF, l_ij, 0);
+            
+            // Only one thread per row updates the shared arrays
             if (s_col == 0) {
-                float m_ij = -INFINITY, l_ij = 0.0f;
-                
-                // Find max value in the row
-                for (int k = 0; k < Bc; k++) {
-                    float val = S_ij_smem[s_row * Bc + k];
-                    if (val > m_ij) {
-                        m_ij = val;
-                    }
-                }
-                
-                for (int k = 0; k < Bc; k++) {
-                    float exp_val = __expf(S_ij_smem[s_row * Bc + k] - m_ij);
-                    S_ij_smem[s_row * Bc + k] = exp_val;
-                    l_ij += exp_val;
-                } 
-                
                 m_ij_smem[s_row] = m_ij;
-                m_new[s_row] = fmaxf(m_ij, m_i[s_row]);
-                l_new[s_row] = __expf(m_i[s_row] - m_new[s_row]) * l_i[s_row] + __expf(m_ij - m_new[s_row]) * l_ij;
+                m_new[s_row] = fmaxf(m_ij, my_m_i);
+                l_new[s_row] = __expf(my_m_i - m_new[s_row]) * my_l_i + __expf(m_ij - m_new[s_row]) * l_ij;
             }
             __syncthreads();
 
-            float alpha = __expf(m_i[s_row] - m_new[s_row]);
+            float alpha = __expf(my_m_i - m_new[s_row]);  // Use register value
             float beta = __expf(m_ij_smem[s_row] - m_new[s_row]);
             
             // Compute S_ij * V_j for this thread's column
@@ -134,14 +146,20 @@ __global__ void flashattn_kernel_v2(
                 
                 // Update output with the running computation
                 float o_old = O_smem[s_row * d + col];
-                float o_new = (1.0f / l_new[s_row]) * (l_i[s_row] * alpha * o_old + beta * PV_acc);
+                float o_new = (1.0f / l_new[s_row]) * (my_l_i * alpha * o_old + beta * PV_acc);  // Use register value
                 O_smem[s_row * d + col] = o_new;
                 O[QKV_head_offset + (i * Br + s_row) * d + col] = o_new;
             }
             
-
-            m[lm_head_offset + (i * Br) + s_row] = m_new[s_row];
-            l[lm_head_offset + (i * Br) + s_row] = l_new[s_row];
+            // Update register values for next iteration
+            my_m_i = m_new[s_row];
+            my_l_i = l_new[s_row];
+            
+            // Write back to global memory
+            if (global_row < T) {
+                m[lm_head_offset + global_row] = my_m_i;
+                l[lm_head_offset + global_row] = my_l_i;
+            }
             __syncthreads();
         }
         __syncthreads();
