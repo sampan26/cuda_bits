@@ -41,9 +41,6 @@ __global__ void flashattn_kernel_v2(
     __shared__ float V_smem[Bc * d];
     __shared__ float S_ij_smem[Br * Bc];
     __shared__ float O_smem[Br * d];
-    __shared__ float m_new[Br];
-    __shared__ float l_new[Br];
-    __shared__ float m_ij_smem[Br];
 
     for (int j = 0; j < Tc; ++j) {
         // Load K and V tiles into shared memory
@@ -101,41 +98,33 @@ __global__ void flashattn_kernel_v2(
             S_ij_smem[s_row * Bc + s_col] = acc;
             __syncthreads();
 
-            // Compute row max and softmax - distributed across threads
-            // Each thread handles one element in the row
-            float my_val = S_ij_smem[s_row * Bc + s_col];
+            // Compute row max and softmax
+            float m_ij = -INFINITY;
             
-            // Find row maximum using warp shuffle reduction
-            float m_ij = my_val;
-            for (int offset = Bc/2; offset > 0; offset /= 2) {
-                float other_val = __shfl_down_sync(0xFFFFFFFF, m_ij, offset);
-                m_ij = fmaxf(m_ij, other_val);
+            // Find max value in the row
+            for (int k = 0; k < Bc; k++) {
+                float val = S_ij_smem[s_row * Bc + k];
+                if (val > m_ij) {
+                    m_ij = val;
+                }
             }
-            // Broadcast the max back to all threads in the row
-            m_ij = __shfl_sync(0xFFFFFFFF, m_ij, 0);
             
-            // Compute exponential and sum
-            float exp_val = __expf(my_val - m_ij);
+            float m_new = fmaxf(m_ij, my_m_i);  // Use register value
+            
+            // All threads compute exp for their column
+            float exp_val = __expf(S_ij_smem[s_row * Bc + s_col] - m_ij);
             S_ij_smem[s_row * Bc + s_col] = exp_val;
-            
-            // Sum reduction using warp shuffle
-            float l_ij = exp_val;
-            for (int offset = Bc/2; offset > 0; offset /= 2) {
-                l_ij += __shfl_down_sync(0xFFFFFFFF, l_ij, offset);
-            }
-            // Broadcast the sum back to all threads
-            l_ij = __shfl_sync(0xFFFFFFFF, l_ij, 0);
-            
-            // Only one thread per row updates the shared arrays
-            if (s_col == 0) {
-                m_ij_smem[s_row] = m_ij;
-                m_new[s_row] = fmaxf(m_ij, my_m_i);
-                l_new[s_row] = __expf(my_m_i - m_new[s_row]) * my_l_i + __expf(m_ij - m_new[s_row]) * l_ij;
-            }
             __syncthreads();
+            
+            // Compute l_ij (sum of exponentials)
+            float l_ij = 0.0f;
+            for (int k = 0; k < Bc; k++) {
+                l_ij += S_ij_smem[s_row * Bc + k];
+            }
+            float l_new = __expf(my_m_i - m_new) * my_l_i + __expf(m_ij - m_new) * l_ij;  // Use register value
 
-            float alpha = __expf(my_m_i - m_new[s_row]);  // Use register value
-            float beta = __expf(m_ij_smem[s_row] - m_new[s_row]);
+            float alpha = __expf(my_m_i - m_new);  // Use register value
+            float beta = __expf(m_ij- m_new);
             
             // Compute S_ij * V_j for this thread's column
             for (int col = s_col; col < d; col += Bc) {
@@ -146,14 +135,14 @@ __global__ void flashattn_kernel_v2(
                 
                 // Update output with the running computation
                 float o_old = O_smem[s_row * d + col];
-                float o_new = (1.0f / l_new[s_row]) * (my_l_i * alpha * o_old + beta * PV_acc);  // Use register value
+                float o_new = (1.0f / l_new) * (my_l_i * alpha * o_old + beta * PV_acc);  // Use register value
                 O_smem[s_row * d + col] = o_new;
                 O[QKV_head_offset + (i * Br + s_row) * d + col] = o_new;
             }
             
             // Update register values for next iteration
-            my_m_i = m_new[s_row];
-            my_l_i = l_new[s_row];
+            my_m_i = m_new;
+            my_l_i = l_new;
             
             // Write back to global memory
             if (global_row < T) {
