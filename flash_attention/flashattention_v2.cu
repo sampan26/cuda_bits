@@ -23,29 +23,25 @@ __global__ void flashattn_kernel_v2(
 
     int s_row = tid / Bc;
     int s_col = tid % Bc;
-    
-    // Register variables for this thread's row statistics
-    float my_m_i = -INFINITY;  // Each thread maintains its own m_i
-    float my_l_i = 0.0f;       // Each thread maintains its own l_i
 
-    const int Tc = cdiv(T, Bc); const int Tr = cdiv(T, Br);
-
+    const int Tc = cdiv(T, Bc); 
+    const int Tr = cdiv(T, Br);
     const int QKV_head_offset = batch_head_id * T * d;
     const int lm_head_offset = batch_head_id * T;
-
-    int num_tiles_kv = cdiv(d, Br);
-    int num_tiles_q = cdiv(d, Bc);
+    const int d_per_thread = d / Bc;
 
     __shared__ float Q_smem[Br * d];
     __shared__ float K_smem[Bc * d];
     __shared__ float V_smem[Bc * d];
     __shared__ float S_ij_smem[Br * Bc];
     __shared__ float O_smem[Br * d];
+    __shared__ float m_i[Br];  // Current row maxes
+    __shared__ float l_i[Br];  // Current row sums
 
     for (int j = 0; j < Tc; ++j) {
         // Load K and V tiles into shared memory
-        for (int x = 0; x < num_tiles_kv; ++x) {
-            int idx = x * (Bc * Br) + tid;
+        for (int k_tile = 0; k_tile < cdiv(Bc * d, BLOCK_SIZE); ++k_tile) {
+            int idx = k_tile * BLOCK_SIZE + tid;
             if (idx < Bc * d) {
                 int kv_row = idx / d;
                 int kv_col = idx % d;
@@ -55,14 +51,13 @@ __global__ void flashattn_kernel_v2(
                 }
             }
         }
-        
         __syncthreads();
 
         // For causal attention, we only process blocks where i >= j
         for (int i = j; i < Tr; ++i) {
             // Load Q and O tiles into shared memory
-            for (int x = 0; x < num_tiles_q; ++x) {
-                int idx = x * (Br * Bc) + tid;
+            for (int k_tile = 0; k_tile < cdiv(Br * d, BLOCK_SIZE); ++k_tile) {
+                int idx = k_tile * BLOCK_SIZE + tid;
                 if (idx < Br * d) {
                     int qo_row = idx / d;
                     int qo_col = idx % d; 
@@ -73,87 +68,89 @@ __global__ void flashattn_kernel_v2(
                 }
             }
             __syncthreads();
-            
-            // Load m_i and l_i from global memory into registers for this thread's row
-            int global_row = i * Br + s_row;
-            if (global_row < T) {
-                my_m_i = m[lm_head_offset + global_row];
-                my_l_i = l[lm_head_offset + global_row];
+
+            // Load m_i and l_i for current block (one thread per row)
+            if (s_col == 0) {
+                int global_row = i * Br + s_row;
+                m_i[s_row] = m[lm_head_offset + global_row];
+                l_i[s_row] = l[lm_head_offset + global_row];
             }
+            __syncthreads();
 
             // Compute S_ij = Q_i * K_j^T
-            float acc = 0.0f;
+            float s_ij_val = 0.0f;
             for (int k = 0; k < d; k++) {
-                acc += Q_smem[s_row * d + k] * K_smem[s_col * d + k];
+                s_ij_val += Q_smem[s_row * d + k] * K_smem[s_col * d + k];
             }
-            acc *= scale;
+            s_ij_val *= scale;
 
             // Apply causal masking
             int query_pos = i * Br + s_row;
             int key_pos = j * Bc + s_col;
             if (key_pos > query_pos) {
-                acc = -INFINITY;
+                s_ij_val = -INFINITY;
             }
             
-            S_ij_smem[s_row * Bc + s_col] = acc;
-            __syncthreads();
-
-            // Compute row max and softmax
-            float m_ij = -INFINITY;
-            
-            // Find max value in the row
-            for (int k = 0; k < Bc; k++) {
-                float val = S_ij_smem[s_row * Bc + k];
-                if (val > m_ij) {
-                    m_ij = val;
-                }
-            }
-            
-            float m_new = fmaxf(m_ij, my_m_i);  // Use register value
-            
-            // All threads compute exp for their column
-            float exp_val = __expf(S_ij_smem[s_row * Bc + s_col] - m_ij);
-            S_ij_smem[s_row * Bc + s_col] = exp_val;
+            S_ij_smem[s_row * Bc + s_col] = s_ij_val;
             __syncthreads();
             
-            // Compute l_ij (sum of exponentials)
-            float l_ij = 0.0f;
-            for (int k = 0; k < Bc; k++) {
-                l_ij += S_ij_smem[s_row * Bc + k];
-            }
-            float l_new = __expf(my_m_i - m_new) * my_l_i + __expf(m_ij - m_new) * l_ij;  // Use register value
 
-            float alpha = __expf(my_m_i - m_new);  // Use register value
-            float beta = __expf(m_ij- m_new);
-            
-            // Compute S_ij * V_j for this thread's column
-            for (int col = s_col; col < d; col += Bc) {
-                float PV_acc = 0.0f;
-                for (int k = 0; k < Bc; k++) {
-                    PV_acc += S_ij_smem[s_row * Bc + k] * V_smem[k * d + col];
-                }
-                
-                // Update output with the running computation
-                float o_old = O_smem[s_row * d + col];
-                float o_new = (1.0f / l_new) * (my_l_i * alpha * o_old + beta * PV_acc);  // Use register value
-                O_smem[s_row * d + col] = o_new;
-                O[QKV_head_offset + (i * Br + s_row) * d + col] = o_new;
+            // Compute row max using warp shuffle (assuming Bc = 32)
+            float m_ij = s_ij_val;
+            for (int offset = Bc/2; offset > 0; offset /= 2) {
+                float other_val = __shfl_down_sync(0xFFFFFFFF, m_ij, offset);
+                m_ij = fmaxf(m_ij, other_val);
             }
+            // Broadcast the max back to all threads in the row
+            m_ij = __shfl_sync(0xFFFFFFFF, m_ij, 0);
             
-            // Update register values for next iteration
-            my_m_i = m_new;
-            my_l_i = l_new;
+            // Compute exponential and sum
+            float p_ij_val = __expf(s_ij_val - m_ij);
+            S_ij_smem[s_row * Bc + s_col] = p_ij_val;
             
-            // Write back to global memory
-            if (global_row < T) {
-                m[lm_head_offset + global_row] = my_m_i;
-                l[lm_head_offset + global_row] = my_l_i;
+            // Sum reduction using warp shuffle
+            float l_ij = p_ij_val;
+            for (int offset = Bc/2; offset > 0; offset /= 2) {
+                l_ij += __shfl_down_sync(0xFFFFFFFF, l_ij, offset);
+            }
+            // Broadcast the sum back to all threads
+            l_ij = __shfl_sync(0xFFFFFFFF, l_ij, 0);
+
+            // Get current values
+            float m_ii = m_i[s_row];
+            float l_ii = l_i[s_row];
+            
+            // Update statistics
+            float m_new = fmaxf(m_ij, m_ii);
+            float l_new = __expf(m_ii - m_new) * l_ii + __expf(m_ij - m_new) * l_ij;
+            
+            // Compute output update
+            for (int k = 0; k < d_per_thread; k++) {
+                int col = s_col + k * Bc;
+                if (col < d) {
+                    float pv_acc = 0.0f;
+                    for (int inner_k = 0; inner_k < Bc; inner_k++) {
+                        pv_acc += S_ij_smem[s_row * Bc + inner_k] * V_smem[inner_k * d + col];
+                    }
+                    
+                    // Update output with the running computation
+                    float o_old = O_smem[s_row * d + col];
+                    float o_new = (1.0f / l_new) * (l_ii * __expf(m_ii - m_new) * o_old + 
+                                                    __expf(m_ij - m_new) * pv_acc);
+                    O[QKV_head_offset + (i * Br + s_row) * d + col] = o_new;
+                }
+            }
+
+            // Write back updated statistics (one thread per row)
+            if (s_col == 0) {
+                int global_row = i * Br + s_row;
+                m[lm_head_offset + global_row] = m_new;
+                l[lm_head_offset + global_row] = l_new;
             }
             __syncthreads();
         }
-        __syncthreads();
     }
-} 
+}
 
 // Host LAUNCHER function
 void flashattn_v2(const float *Q, const float *K, const float *V, float *O,

@@ -8,7 +8,8 @@ constexpr int d = 64;
 __host__ __device__ inline constexpr int cdiv(int a, int b) { return (a + b - 1) / b; }
 
 template<int BLOCK_SIZE, int Br, int Bc>
-__global__ void flashattn_kernel_v3(
+__global__ __launch_bounds__(BLOCK_SIZE, 1)
+void flashattn_kernel_v3(
     const float *Q, // [B, nh, T, head_dim]
     const float *K, // [B, nh, T, head_dim]
     const float *V, // [B, nh, T, head_dim]
@@ -25,7 +26,8 @@ __global__ void flashattn_kernel_v3(
 
     const int Tc = cdiv(T, Bc);
 
-    const int QKV_head_offset = batch_head_id * T * d;
+    const int batch_head_offset = batch_head_id * T * d;
+    const int QO_offset = batch_head_offset + i * Br * d;
 
     // --- Shared Memory Declarations ---
     __shared__ float Q_smem[Br * d];
@@ -50,33 +52,28 @@ __global__ void flashattn_kernel_v3(
         l_i[s_row] = 0.0f;
     }
 
-    for (int k_tile = 0; k_tile < cdiv(Br * d, BLOCK_SIZE); ++k_tile) {
-        int idx = k_tile * BLOCK_SIZE + tid;
+    for (int tid_offset = 0; tid_offset < cdiv(Br * d, BLOCK_SIZE); ++tid_offset) {
+        int idx = tid_offset * BLOCK_SIZE + tid;
         if (idx < Br * d) {
             int q_row = idx / d;
             int q_col = idx % d;
             if (i * Br + q_row < T) {
-                Q_smem[q_row * d + q_col] = Q[QKV_head_offset + (i * Br + q_row) * d + q_col];
-            } else {
-                Q_smem[q_row * d + q_col] = 0.0f; // Padding
+                Q_smem[q_row * d + q_col] = Q[QO_offset + q_row * d + q_col];
             }
         }
     }
     __syncthreads();
 
     for (int j = 0; j <= i; ++j) {
-        for (int k_tile = 0; k_tile < cdiv(Bc * d, BLOCK_SIZE); ++k_tile) {
-            int idx = k_tile * BLOCK_SIZE + tid;
+        for (int tid_offset = 0; tid_offset < cdiv(Bc * d, BLOCK_SIZE); ++tid_offset) {
+            int idx = tid_offset * BLOCK_SIZE + tid;
             if (idx < Bc * d) {
                 int kv_row = idx / d;
                 int kv_col = idx % d;
                 if (j * Bc + kv_row < T) {
-                    K_smem[kv_row * d + kv_col] = K[QKV_head_offset + (j * Bc + kv_row) * d + kv_col];
-                    V_smem[kv_row * d + kv_col] = V[QKV_head_offset + (j * Bc + kv_row) * d + kv_col];
-                } else { // Padding
-                    K_smem[kv_row * d + kv_col] = 0.0f; 
-                    V_smem[kv_row * d + kv_col] = 0.0f;
-                }
+                    K_smem[kv_row * d + kv_col] = K[batch_head_offset + (j * Bc + kv_row) * d + kv_col];
+                    V_smem[kv_row * d + kv_col] = V[batch_head_offset + (j * Bc + kv_row) * d + kv_col];
+                } 
             }
         }
         __syncthreads();
@@ -148,7 +145,7 @@ __global__ void flashattn_kernel_v3(
     if (global_row < T) {
         for (int k = 0; k < d_per_thread; k++) {
             int global_col = s_col + k * Bc;
-            O[QKV_head_offset + global_row * d + global_col] = O_reg[k];
+            O[batch_head_offset + global_row * d + global_col] = O_reg[k];
         }
     }
 }
