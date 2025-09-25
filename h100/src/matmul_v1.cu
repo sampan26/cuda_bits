@@ -55,7 +55,6 @@ __device__ void wgmma_m64n64k16(float d[4][8], bf16 *sA, bf16 *sB) {
       "n"(int32_t(ScaleB)), "n"(int32_t(TransA)), "n"(int32_t(TransB)));
 }
 
-template <int BlockMajorSize, int BlockMinorSize>
 void create_tensor_map(CUtensorMap* tma_map, bf16 *src, int shape_major, int shape_minor) {
   void *src_addr = (void*)src;
   uint64_t gmem_prob_shape[5] = {shape_major, shape_major, 1, 1, 1};
@@ -64,7 +63,7 @@ void create_tensor_map(CUtensorMap* tma_map, bf16 *src, int shape_major, int sha
   uint32_t smem_box_stride[5] = {1,1,1,1,1}; 
 
   CUresult result = cuTensorMapEncodeTiled( tma_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 
-                    2, gmem_address, gmem_prob_shape, gmem_prob_stride + 1, smem_box_shape,
+                    2, src_addr, gmem_prob_shape, gmem_prob_stride + 1, smem_box_shape,
                     smem_box_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, 
                     CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 }
@@ -76,7 +75,7 @@ __host__ static CUtensorMap* init_tensor_map(bf16* src, int shape_major, int sha
   CUtensorMap *tma_map_d;
   cudaMalloc(&tma_map_d, sizeof(CUtensorMap));
   CUtensorMap *tma_map_h;
-  create_tensor_map(&tma_map_h, src, height, width);
+  create_tensor_map(&tma_map_h, src, shape_major, shape_minor);
   cudaMemcpy(tma_map_d, &tma_map_d, sizeof(CUtensorMap), cudaMemcpyHostToDevice);
   return tma_map_d;
 }
@@ -108,12 +107,12 @@ matmul_kernel_v1(int M, int N, int K, bf16* C,
 
     barrier::arrival_token token_A, token_B;
 
-    for (int k_tile = 0; k_tile < num_tiles_k; ++k) {
+    for (int k_tile = 0; k_tile < num_tiles_k; ++k_tile) {
       if (threadIdx.x == 0) {
         cde::cp_async_bulk_tensor_2d_global_to_shared(&sA[0], tensorMapA, k_tile*BK, tile_m*BM, bar_A);
-        token_A = cuda::device::barrier_arrive_tx(barA, 1, sizeof(sA));
+        token_A = cuda::device::barrier_arrive_tx(bar_A, 1, sizeof(sA));
         cde::cp_async_bulk_tensor_2d_global_to_shared(&sB[0], tensorMapB, k_tile*BK, tile_n*BN, bar_B);
-        token_B = cuda::device::barrier_arrive_tx(barB, 1, sizeof(sB));
+        token_B = cuda::device::barrier_arrive_tx(bar_B, 1, sizeof(sB));
       }
       barA.wait(std::move(token_A));
       barA.wait(std::move(token_B));
@@ -136,12 +135,12 @@ void matmul_v1(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
   constexpr int BK = 64;
   constexpr int NUM_THREADS = 128;
   
-  tma_map_A = init_tensor_map(A, M, K);
-  tma_map_B = init_tensor_map(B, N, K);
+  d_tma_map_A = init_tensor_map(A, M, K);
+  d_tma_map_B = init_tensor_map(B, N, K);
 
   matmul_kernel_v1<BM,BN,BK, 64, 64, 16, NUM_THREADS><<<(M/BM) * (N/BN), NUM_THREADS>>>(
     M, N, K, C, d_tma_map_A, d_tma_map_B);
 }
 
-}
+};
 using M2:matmul_v1
