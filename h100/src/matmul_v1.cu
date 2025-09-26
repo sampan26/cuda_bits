@@ -93,7 +93,7 @@ matmul_kernel_v1(int M, int N, int K, bf16* C,
     const int num_tiles_k = K / BK;
     const int num_rows_n = N / BN;
     const int tile_m = blockIdx.x / num_rows_n;
-    const int tile_n = blockIdx.y % num_rows_n;
+    const int tile_n = blockIdx.x % num_rows_n;
 
     __shared__ barrier bar_A;
     __shared__ barrier bar_B;
@@ -114,18 +114,30 @@ matmul_kernel_v1(int M, int N, int K, bf16* C,
         cde::cp_async_bulk_tensor_2d_global_to_shared(&sB[0], tensorMapB, k_tile*BK, tile_n*BN, bar_B);
         token_B = cuda::device::barrier_arrive_tx(bar_B, 1, sizeof(sB));
       }
-      barA.wait(std::move(token_A));
-      barA.wait(std::move(token_B));
+      else {
+        token_A = bar_A.arrive();
+        token_B = bar_B.arrive();
+      }
+      bar_A.wait(std::move(token_A));
+      bar_B.wait(std::move(token_B));
       __syncthreads();
 
 
       warpgroup_arrive();
-      wgmma_m64n64k16<1, 1, 1, 0, 0>(&sA[0], &sB[0]);
-      wgmma_m64n64k16<1, 1, 1, 0, 0>(&sA[0], &sB[0]);
-      wgmma_m64n64k16<1, 1, 1, 0, 0>(&sA[0], &sB[0]);
-      wgmma_m64n64k16<1, 1, 1, 0, 0>(&sA[0], &sB[0]);
+      wgmma_m64n64k16<1, 1, 1, 0, 0>(d, &sA[0], &sB[0]);
+      wgmma_m64n64k16<1, 1, 1, 0, 0>(d, &sA[WGMMA_K], &sB[WGMMA_K]);
+      wgmma_m64n64k16<1, 1, 1, 0, 0>(d, &sA[2*WGMMA_K], &sB[2*WGMMA_K]);
+      wgmma_m64n64k16<1, 1, 1, 0, 0>(d, &sA[3*WGMMA_K], &sB[3*WGMMA_K]);
       warpgroup_commit_batch();
       warpgroup_wait<0>();
+    }
+    {
+      int tid = threadIdx.x;
+      int lane_id = tid % 32;
+      int warp_id = tid / 32;
+      uint32_t row = warp_id*18 + lane_id / 4;
+
+      bf16 *out_C = C + tile_m*BM*M + tile_n*BN;
     }
 
 }
