@@ -83,12 +83,19 @@ __host__ static inline CUtensorMap* init_tensor_map(bf16* src, int shape_major, 
   return tma_map_d;
 }
 
+template <int BM, int BN, int BK>
+struct SharedStorage {
+  alignas(128) bf16 A[BM*BK];
+  alignas(128) bf16 B[BK*BN];
+}
 
-template<int BM, int BN, int BK, int WGMMA_M, int WGMMA_N, int WGMMA_K, int NUM_THREADS>
+template<int BM, int BN, int BK, int NUM_THREADS, bool DBG>
 __global__ void __launch_bounds__(NUM_THREADS) 
 matmul_kernel_v1(int M, int N, int K, bf16* C, 
                  const CUtensorMap* tensorMapA, 
-                 const CUtensorMap* tensorMapB) {
+                 const CUtensorMap* tensorMapB,
+                 int *DB) {
+    constexpr int WGMMA_M = 64, WGMMA_K = 16m WGMMA_N = BN;
     __shared__ alignas(128) bf16 sA[BM * BK];
     __shared__ alignas(128) bf16 sB[BK * BN];
     float d[WGMMA_N/16][8];
@@ -164,18 +171,21 @@ matmul_kernel_v1(int M, int N, int K, bf16* C,
     }
   }
 }
-void matmul_v1(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
-  constexpr int BM = 64;
-  constexpr int BN = 64;
+void matmul_v2(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
+  constexpr int BM = 128;
+  constexpr int BN = 128;
   constexpr int BK = 64;
   constexpr int NUM_THREADS = 128;
   
   d_tma_map_A = init_tensor_map(A, M, K);
   d_tma_map_B = init_tensor_map(B, N, K);
 
-  matmul_kernel_v1<BM,BN,BK, 64, 64, 16, NUM_THREADS><<<(M/BM) * (N/BN), NUM_THREADS>>>(
-    M, N, K, C, d_tma_map_A, d_tma_map_B);
+  auto *kernel = DB ? matmul_kernel_v2<BM,BN,BK, NUM_THREADS, true> :
+  matmul_kernel_v2<BM,BN,BK, NUM_THREADS, false>;
+  size_t smem_size = sizeof(SharedStorage<BM, BN, BK>);
+  matmul_kernel_v2<<<(M/BM) * (N/BN), NUM_THREADS, smem_size>>>(
+    M, N, K, C, d_tma_map_A, d_tma_map_B, DB);
 }
 
 };
-using M2::matmul_v1;
+using M2::matmul_v2;
