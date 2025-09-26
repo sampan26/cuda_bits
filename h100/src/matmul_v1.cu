@@ -135,9 +135,28 @@ matmul_kernel_v1(int M, int N, int K, bf16* C,
       int tid = threadIdx.x;
       int lane_id = tid % 32;
       int warp_id = tid / 32;
-      uint32_t row = warp_id*18 + lane_id / 4;
+      uint32_t row = warp_id*16 + lane_id / 4;
 
-      bf16 *out_C = C + tile_m*BM*M + tile_n*BN;
+      bf16 *out_C = C + tile_n*BN*M + tile_m*BM;
+      for (int m = 0; m < BM / WGMMA_M; ++m) {
+        for (int n = 0; n < BN/WGMMA_N; ++n) {
+          for (int w = 0; w < WGMMA_N / 16; ++w) {
+            int col = w*WGMMA_K + 2*(tid % 4);
+            #define IDX(i, j) ((n*WGMMA_N+j)*M + ((i) + m*WGMMA_M))
+
+            out_C[IDX(row, col)] = d[w][0];
+            out_C[IDX(row, col+1)] = d[w][1];
+            out_C[IDX(row+8, col)] = d[w][2];
+            out_C[IDX(row+8, col+1)] = d[w][3];
+
+            out_C[IDX(row, col+8)] = d[w][4];
+            out_C[IDX(row, col+9)] = d[w][5];
+            out_C[IDX(row+8, col+8)] = d[w][6];
+            out_C[IDX(row+8, col+9)] = d[w][7];
+
+            #undef IDX
+          }
+      }
     }
 
 }
