@@ -15,6 +15,8 @@
 #include <cassert>
 #include <unistd.h>
 
+#include "src/matmul_v1.cu"
+
 typedef __nv_bfloat16 bf16;
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
@@ -26,43 +28,18 @@ void cudaCheck(cudaError_t error, const char *file, int line) {
 }
 #define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
 
-// Simple matrix multiplication kernel as placeholder
-__global__ void matmul_v1_kernel(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    if (row < M && col < N) {
-        float sum = 0.0f;
-        for (int k = 0; k < K; k++) {
-            sum += __bfloat162float(A[row * K + k]) * __bfloat162float(B[k * N + col]);
-        }
-        C[row * N + col] = __float2bfloat16(sum);
-    }
-}
-
-void matmul_v1(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
-    dim3 block(16, 16);
-    dim3 grid(CEIL_DIV(N, block.x), CEIL_DIV(M, block.y));
-    matmul_v1_kernel<<<grid, block>>>(M, N, K, A, B, C);
-}
-
 std::default_random_engine generator(69);
 
 cublasHandle_t cublas_handle;
 void runCublasGemmBF16(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
-    const float alpha = 1.0f, beta = 0.0f;
-    cublasStatus_t status = cublasGemmEx(cublas_handle, 
-                                        CUBLAS_OP_N, CUBLAS_OP_N, 
-                                        M, N, K, 
-                                        &alpha, 
-                                        A, CUDA_R_16BF, M,
-                                        B, CUDA_R_16BF, K, 
-                                        &beta, 
-                                        C, CUDA_R_16BF, M,
-                                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    float alpha = 1, beta = 0;
+    // C(column major) = A(row major) * B(column major)
+    cublasStatus_t status = cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, &alpha, A, CUDA_R_16BF,
+      N, B, CUDA_R_16BF, K, &beta, C, CUDA_R_16BF, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+  
     if (status != CUBLAS_STATUS_SUCCESS) {
-        std::cout << "CUBLAS error: " << status << std::endl;
-        exit(1);
+      std::cout << "CUBLAS error: " << status << std::endl;
+      exit(1);
     }
 }
 
@@ -79,11 +56,11 @@ void run_kernel(int kernel_num, int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, 
     
 int yo = 0;
 void randomize_matrix(bf16 *mat, int N) {
-    std::normal_distribution<float> distribution(0, 1);
-    for (int i = 0; i < N; i++) {
-        mat[i] = __float2bfloat16(distribution(generator));
-    }
-    ++yo;
+  std::normal_distribution<float> distribution(0, 1);
+  for (int i = 0; i < N; i++) {
+    mat[i] = distribution(generator);
+  }
+  ++yo;
 }
 
 bool verify_matrix(bf16 *matRef, bf16 *matOut, int N) {
