@@ -200,7 +200,7 @@ __device__ void wgmma_m64n16k16(float d[1][8], bf16 *sA, bf16 *sB) {
   uint64_t desc_b = make_smem_desc(&sB[0]);
   asm volatile(
     "{\n"
-    "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 "
+    "wgmma.mma_async.sync.aligned.m64n16k16.f32.bf16.bf16 "
     "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7},   "
     " %8,   "
     " %9,   "
