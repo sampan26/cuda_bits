@@ -81,6 +81,10 @@ bool verify_matrix(bf16 *matRef, bf16 *matOut, int N) {
 
 int main() {
     cublasCreate(&cublas_handle);
+    float elapsed_time;
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
 
     long max_size = 8192;
     long m = max_size, n = max_size, k = max_size;
@@ -138,6 +142,22 @@ int main() {
         } else if (kernel_num > 0) {
             std::cout << "Correctness verification passed!" << std::endl;
         }
+
+        cudaEventRecord(start);
+        for (int j = 0; j < 8; ++j) {
+          run_kernel(kernel_num, m, n, k, dA, dB, dC);
+        }
+        cudaEventRecord(stop);
+        cudaEventSynchronize(start);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&elapsed_time, start, stop);
+        
+        long flops = (2LL * m) * (n * k);
+        printf(
+            "Average elapsed time: (%7.6f) s, performance: (%7.1f) TFLOPS. size: (%ld).\n\n",
+            elapsed_time / 1000.0 / repeat_times,
+            (repeat_times * flops * 1e-9) / elapsed_time, m);
+        
     }
     
     // Cleanup
