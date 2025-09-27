@@ -216,22 +216,23 @@ template<int WGMMA_N, int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB
 __device__ inline void wgmma(float d[WGMMA_N/16][8], bf16 *sA, bf16 *sB) {
   static_assert(WGMMA_N == 32 || WGMMA_N == 64 || WGMMA_N == 128 || WGMMA_N == 192 || WGMMA_N == 256);
   if constexpr (WGMMA_N == 256)
-    wgmma_m64n256k16<1, 1, 0, 0, 0>(d, sA, sB);
+    wgmma_m64n256k16<1, 1, 1, 0, 0>(d, sA, sB);
   if constexpr (WGMMA_N == 192)
-    wgmma_m64n192k16<1, 1, 0, 0, 0>(d, sA, sB);
+    wgmma_m64n192k16<1, 1, 1, 0, 0>(d, sA, sB);
   if constexpr (WGMMA_N == 128)
-    wgmma_m64n128k16<1, 1, 0, 0, 0>(d, sA, sB);
+    wgmma_m64n128k16<1, 1, 1, 0, 0>(d, sA, sB);
   if constexpr (WGMMA_N == 64)
-    wgmma_m64n64k16<1, 1, 0, 0, 0>(d, sA, sB);
+    wgmma_m64n64k16<1, 1, 1, 0, 0>(d, sA, sB);
   if constexpr (WGMMA_N == 32)
-    wgmma_m64n32k16<1, 1, 0, 0, 0>(d, sA, sB);
+    wgmma_m64n32k16<1, 1, 1, 0, 0>(d, sA, sB);
 }
 
+template <int BlockMajorSize, int BlockMinorSize>
 void create_tensor_map(CUtensorMap* tma_map, bf16 *src, int shape_major, int shape_minor) {
   void *src_addr = (void*)src;
   uint64_t gmem_prob_shape[5] = {(uint64_t)shape_minor, (uint64_t)shape_major, 1, 1, 1};
   uint64_t gmem_prob_stride[5] = {sizeof(bf16), sizeof(bf16) * shape_minor, 0, 0, 0};
-  uint32_t smem_box_shape[5] = {64, 64, 1, 1, 1}; // BN, BM for your block sizes
+  uint32_t smem_box_shape[5] = {(uint32_t)BlockMinorSize, (uint32_t)BlockMajorSize, 1, 1, 1}; // BN, BM for your block sizes
   uint32_t smem_box_stride[5] = {1, 1, 1, 1, 1}; 
 
   CUresult result = cuTensorMapEncodeTiled(tma_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 
@@ -244,11 +245,12 @@ void create_tensor_map(CUtensorMap* tma_map, bf16 *src, int shape_major, int sha
 CUtensorMap *d_tma_map_A = 0;
 CUtensorMap *d_tma_map_B = 0;
 
+template <int BlockMajorSize, int BlockMinorSize>
 __host__ static inline CUtensorMap* init_tensor_map(bf16* src, int shape_major, int shape_minor) {
   CUtensorMap *tma_map_d;
   cudaMalloc(&tma_map_d, sizeof(CUtensorMap));
   CUtensorMap tma_map_h;  // Fixed: declare as value
-  create_tensor_map(&tma_map_h, src, shape_major, shape_minor);
+  create_tensor_map<BlockMajorSize, BlockMinorSize>(&tma_map_h, src, shape_major, shape_minor);
   cudaMemcpy(tma_map_d, &tma_map_h, sizeof(CUtensorMap), cudaMemcpyHostToDevice);  // Fixed: use tma_map_h
   return tma_map_d;
 }
@@ -294,9 +296,9 @@ matmul_kernel_v2(int M, int N, int K, bf16* C,
     for (int k_tile = 0; k_tile < num_tiles_k; ++k_tile) {
       if (threadIdx.x == 0) {
         cde::cp_async_bulk_tensor_2d_global_to_shared(&sA[0], tensorMapA, k_tile*BK, tile_m*BM, bar_A);
-        token_A = cuda::device::barrier_arrive_tx(bar_A, 1, sizeof(sA));
+        token_A = cuda::device::barrier_arrive_tx(bar_A, 1, BM * BK * sizeof(bf16));
         cde::cp_async_bulk_tensor_2d_global_to_shared(&sB[0], tensorMapB, k_tile*BK, tile_n*BN, bar_B);
-        token_B = cuda::device::barrier_arrive_tx(bar_B, 1, sizeof(sB));
+        token_B = cuda::device::barrier_arrive_tx(bar_B, 1, BM * BK * sizeof(bf16));
       }
       else {
         token_A = bar_A.arrive();
@@ -352,8 +354,8 @@ void matmul_v2(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
   constexpr int BK = 64;
   constexpr int NUM_THREADS = 128;
   
-  d_tma_map_A = init_tensor_map(A, M, K);
-  d_tma_map_B = init_tensor_map(B, N, K);
+  d_tma_map_A = init_tensor_map<BM, BK>(A, M, K);
+  d_tma_map_B = init_tensor_map<BN, BK>(B, N, K);
  
   size_t smem_size = sizeof(SharedStorage<BM, BN, BK>);
   matmul_kernel_v2<BM,BN,BK, NUM_THREADS><<<(M/BM) * (N/BN), NUM_THREADS, smem_size>>>(

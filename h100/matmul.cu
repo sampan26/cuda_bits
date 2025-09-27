@@ -115,7 +115,7 @@ int main() {
     cudaCheck(cudaMemcpy(dA, A, sizeof(bf16) * max_size * max_size, cudaMemcpyHostToDevice));
     cudaCheck(cudaMemcpy(dB, B, sizeof(bf16) * max_size * max_size, cudaMemcpyHostToDevice));
 
-    for (int kernel_num : {0, 1}) {
+    for (int kernel_num : {0, 1, 2}) {
         // Give the GPU some rest to avoid thermal throttling
         sleep(5);
         std::cout << "KERNEL " << kernel_num << std::endl;
