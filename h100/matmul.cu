@@ -16,6 +16,8 @@
 #include <unistd.h>
 
 #include "src/matmul_v1.cu"
+#include "src/matmul_v2.cu"
+
 
 typedef __nv_bfloat16 bf16;
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
@@ -43,13 +45,16 @@ void runCublasGemmBF16(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     }
 }
 
-void run_kernel(int kernel_num, int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB = nullptr) {
+void run_kernel(int kernel_num, int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     switch (kernel_num) {
         case 0:
             runCublasGemmBF16(M, N, K, A, B, C);
             break;
         case 1:
             matmul_v1(M, N, K, A, B, C);
+            break;
+        case 2:
+            matmul_v2(M, N, K, A, B, C);
             break;
     }
 }
@@ -92,16 +97,11 @@ int main() {
     bf16 *A = nullptr, *B = nullptr, *C = nullptr, *C_ref = nullptr;  // host matrices
     bf16 *dA = nullptr, *dB = nullptr, *dC = nullptr, *dC_ref = nullptr; // device matrices
     
-    int *DB = nullptr; 
-    int *dDB = nullptr;  
-
     A = (bf16 *)malloc(sizeof(bf16) * max_size * max_size);
     B = (bf16 *)malloc(sizeof(bf16) * max_size * max_size);
     C = (bf16 *)malloc(sizeof(bf16) * max_size * max_size);
     C_ref = (bf16 *)malloc(sizeof(bf16) * max_size * max_size);
-    DB = (int *)malloc(sizeof(int) * max_size * 128);
     
-    cudaCheck(cudaMalloc((void **)&dDB, sizeof(int) * max_size * 128));
     
     randomize_matrix(A, max_size * max_size);
     randomize_matrix(B, max_size * max_size);
@@ -123,11 +123,9 @@ int main() {
         memset(C, 0, sizeof(bf16) * max_size * max_size);
         cudaCheck(cudaMemcpy(dC, C, sizeof(bf16) * max_size * max_size, cudaMemcpyHostToDevice));
         cudaCheck(cudaMemcpy(dC_ref, C, sizeof(bf16) * max_size * max_size, cudaMemcpyHostToDevice));
-        memset(DB, ~0, sizeof(int) * max_size * 128);
-        cudaCheck(cudaMemcpy(dDB, DB, sizeof(int) * max_size * 128, cudaMemcpyHostToDevice));
         
         run_kernel(0, m, n, k, dA, dB, dC_ref); // cuBLAS
-        run_kernel(kernel_num, m, n, k, dA, dB, dC, dDB); // Executes the kernel, modifies the result matrix
+        run_kernel(kernel_num, m, n, k, dA, dB, dC); // Executes the kernel, modifies the result matrix
         
         cudaCheck(cudaDeviceSynchronize());
         cudaCheck(cudaGetLastError()); // Check for async errors during kernel run
@@ -137,7 +135,6 @@ int main() {
 
         if (kernel_num > 0 && !verify_matrix(C_ref, C, m * n)) {
             std::cout << "~~~~~~~~~~~~~~~~ Failed to pass the correctness verification against cuBLAS. ~~~~~~~~~~~~~~~~" << std::endl;
-            cudaMemcpy(DB, dDB, sizeof(int) * max_size * 8, cudaMemcpyDeviceToHost);
             printf("%f\n", __bfloat162float(C_ref[m]));
         } else if (kernel_num > 0) {
             std::cout << "Correctness verification passed!" << std::endl;
@@ -155,8 +152,8 @@ int main() {
         long flops = (2LL * m) * (n * k);
         printf(
             "Average elapsed time: (%7.6f) s, performance: (%7.1f) TFLOPS. size: (%ld).\n\n",
-            elapsed_time / 1000.0 / repeat_times,
-            (repeat_times * flops * 1e-9) / elapsed_time, m);
+            elapsed_time / 1000.0 / 8,
+            (8 * flops * 1e-9) / elapsed_time, m);
         
     }
     
@@ -165,12 +162,10 @@ int main() {
     free(B);
     free(C);
     free(C_ref);
-    free(DB);
     cudaFree(dA);
     cudaFree(dB);
     cudaFree(dC);
     cudaFree(dC_ref);
-    cudaFree(dDB);
     cublasDestroy(cublas_handle);
     
     return 0;

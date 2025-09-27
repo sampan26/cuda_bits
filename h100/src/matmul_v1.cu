@@ -1,4 +1,4 @@
-namespace M2 {
+namespace M1 {
 
 typedef __nv_bfloat16 bf16;
 
@@ -148,15 +148,15 @@ matmul_kernel_v1(int M, int N, int K, bf16* C,
             int col = w*WGMMA_K + 2*(tid % 4);
             #define IDX(i, j) ((n*WGMMA_N+j)*M + ((i) + m*WGMMA_M))
 
-            out_C[IDX(row, col)] = __float2bfloat16(d[w][0]);
-            out_C[IDX(row, col+1)] = __float2bfloat16(d[w][1]);
-            out_C[IDX(row+8, col)] = __float2bfloat16(d[w][2]);
-            out_C[IDX(row+8, col+1)] = __float2bfloat16(d[w][3]);
+            out_C[IDX(row, col)] = d[w][0];
+            out_C[IDX(row, col+1)] = d[w][1];
+            out_C[IDX(row+8, col)] = d[w][2];
+            out_C[IDX(row+8, col+1)] = d[w][3];
 
-            out_C[IDX(row, col+8)] = __float2bfloat16(d[w][4]);
-            out_C[IDX(row, col+9)] = __float2bfloat16(d[w][5]);
-            out_C[IDX(row+8, col+8)] = __float2bfloat16(d[w][6]);
-            out_C[IDX(row+8, col+9)] = __float2bfloat16(d[w][7]);
+            out_C[IDX(row, col+8)] = d[w][4];
+            out_C[IDX(row, col+9)] = d[w][5];
+            out_C[IDX(row+8, col+8)] = d[w][6];
+            out_C[IDX(row+8, col+9)] = d[w][7];
 
             #undef IDX
           }
@@ -178,4 +178,4 @@ void matmul_v1(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
 }
 
 };
-using M2::matmul_v1;
+using M1::matmul_v1;

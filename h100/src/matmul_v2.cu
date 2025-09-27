@@ -32,7 +32,7 @@ __device__ void warpgroup_wait() {
 }
 
 template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
-__device__ void wgmma256(float d[16][8], bf16* sA, bf16* sB) {
+__device__ void wgmma_m64n256k16(float d[16][8], bf16* sA, bf16* sB) {
     uint64_t desc_a = make_smem_desc(&sA[0]);
     uint64_t desc_b = make_smem_desc(&sB[0]);
     asm volatile(
@@ -216,15 +216,15 @@ template<int WGMMA_N, int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB
 __device__ inline void wgmma(float d[WGMMA_N/16][8], bf16 *sA, bf16 *sB) {
   static_assert(WGMMA_N == 32 || WGMMA_N == 64 || WGMMA_N == 128 || WGMMA_N == 192 || WGMMA_N == 256);
   if constexpr (WGMMA_N == 256)
-    wgmma_m64n256k16(d, sA, sB);
+    wgmma_m64n256k16<1, 1, 0, 0, 0>(d, sA, sB);
   if constexpr (WGMMA_N == 192)
-    wgmma_m64n192k16(d, sA, sB);
+    wgmma_m64n192k16<1, 1, 0, 0, 0>(d, sA, sB);
   if constexpr (WGMMA_N == 128)
-    wgmma_m64n128k16(d, sA, sB);
+    wgmma_m64n128k16<1, 1, 0, 0, 0>(d, sA, sB);
   if constexpr (WGMMA_N == 64)
-    wgmma_m64n64k16(d, sA, sB);
+    wgmma_m64n64k16<1, 1, 0, 0, 0>(d, sA, sB);
   if constexpr (WGMMA_N == 32)
-    wgmma_m64n32k16(d, sA, sB);
+    wgmma_m64n32k16<1, 1, 0, 0, 0>(d, sA, sB);
 }
 
 void create_tensor_map(CUtensorMap* tma_map, bf16 *src, int shape_major, int shape_minor) {
@@ -257,22 +257,20 @@ template <int BM, int BN, int BK>
 struct SharedStorage {
   alignas(128) bf16 A[BM*BK];
   alignas(128) bf16 B[BK*BN];
-}
+};
 
-template<int BM, int BN, int BK, int NUM_THREADS, bool DBG>
+template<int BM, int BN, int BK, int NUM_THREADS>
 __global__ void __launch_bounds__(NUM_THREADS) 
-matmul_kernel_v1(int M, int N, int K, bf16* C, 
+matmul_kernel_v2(int M, int N, int K, bf16* C, 
                  const CUtensorMap* tensorMapA, 
-                 const CUtensorMap* tensorMapB,
-                 int *DB) {
-    constexpr int WGMMA_M = 64, WGMMA_K = 16m WGMMA_N = BN;
-    extern __shared__ char shared_memory;
-    using SharedStorage = SharedStorage<BM, BN, BK>;
-    SharedStorage* smem = reinterpret_cast<SharedStorage*>(shared_memory);
+                 const CUtensorMap* tensorMapB) {
+    constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N = BN;
+    constexpr int num_wg_m = BM / (NUM_THREADS / 128);
+    extern __shared__ SharedStorage<BM, BN, BK> smem;
     bf16 *sA = smem.A;
     bf16 *sB = smem.B;
 
-    float d[BM / WGMMA_M][WGMMA_N/16][8];
+    float d[num_wg_m / WGMMA_M][WGMMA_N/16][8];
     memset(d, 0, sizeof(d));
 
     const int num_tiles_k = K / BK;
@@ -309,8 +307,8 @@ matmul_kernel_v1(int M, int N, int K, bf16* C,
       __syncthreads();
 
       warpgroup_arrive();
-      for (int m = 0; m < BM /WGMMA_M; ++m) {
-        bf16 *wg_a_tile_m = sA + WGMMA_M*(m + wg_idx*BM)*BK;
+      for (int m = 0; m < num_wg_m /WGMMA_M; ++m) {
+        bf16 *wg_a_tile_m = sA + WGMMA_M*(m + wg_idx*num_wg_m/WGMMA_M)*BK;
         for (int k = 0; k < BK / WGMMA_K; ++k) {
           wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m], &wg_a_tile_m[k*WGMMA_K], &sB[k*WGMMA_K]);
         }
@@ -325,29 +323,30 @@ matmul_kernel_v1(int M, int N, int K, bf16* C,
       uint32_t row = warp_id*16 + lane_id / 4;
 
       bf16 *out_C = C + tile_n*BN*M + tile_m*BM;
-      for (int m = 0; m < BM / WGMMA_M; ++m) {
-        for (int n = 0; n < BN/WGMMA_N; ++n) {
+
+      for (int m = 0; m < num_wg_m / WGMMA_M; ++m) {
+        int wg_block_m = m * WGMMA_M + wg_idx * num_wg_m;
           for (int w = 0; w < WGMMA_N / 16; ++w) {
-            int col = w*WGMMA_K + 2*(tid % 4);
-            #define IDX(i, j) ((n*WGMMA_N+j)*M + ((i) + m*WGMMA_M))
+            int col = w*16 + 2*(tid % 4);
+            #define IDX(i, j) ((j)*M + (i + wg_block_m))
 
-            out_C[IDX(row, col)] = __float2bfloat16(d[w][0]);
-            out_C[IDX(row, col+1)] = __float2bfloat16(d[w][1]);
-            out_C[IDX(row+8, col)] = __float2bfloat16(d[w][2]);
-            out_C[IDX(row+8, col+1)] = __float2bfloat16(d[w][3]);
+            out_C[IDX(row, col)] = d[m][w][0];
+            out_C[IDX(row, col+1)] = d[m][w][1];
+            out_C[IDX(row+8, col)] = d[m][w][2];
+            out_C[IDX(row+8, col+1)] = d[m][w][3];
 
-            out_C[IDX(row, col+8)] = __float2bfloat16(d[w][4]);
-            out_C[IDX(row, col+9)] = __float2bfloat16(d[w][5]);
-            out_C[IDX(row+8, col+8)] = __float2bfloat16(d[w][6]);
-            out_C[IDX(row+8, col+9)] = __float2bfloat16(d[w][7]);
+            out_C[IDX(row, col+8)] = d[m][w][4];
+            out_C[IDX(row, col+9)] = d[m][w][5];
+            out_C[IDX(row+8, col+8)] = d[m][w][6];
+            out_C[IDX(row+8, col+9)] = d[m][w][7];
 
             #undef IDX
+          
           }
-      }
     }
   }
 }
-void matmul_v2(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
+void matmul_v2(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
   constexpr int BM = 128;
   constexpr int BN = 128;
   constexpr int BK = 64;
@@ -355,12 +354,11 @@ void matmul_v2(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
   
   d_tma_map_A = init_tensor_map(A, M, K);
   d_tma_map_B = init_tensor_map(B, N, K);
-
-  auto *kernel = DB ? matmul_kernel_v2<BM,BN,BK, NUM_THREADS, true> :
-  matmul_kernel_v2<BM,BN,BK, NUM_THREADS, false>;
+ 
   size_t smem_size = sizeof(SharedStorage<BM, BN, BK>);
-  matmul_kernel_v2<<<(M/BM) * (N/BN), NUM_THREADS, smem_size>>>(
-    M, N, K, C, d_tma_map_A, d_tma_map_B, DB);
+  matmul_kernel_v2<BM,BN,BK, NUM_THREADS><<<(M/BM) * (N/BN), NUM_THREADS, smem_size>>>(
+    M, N, K, C, d_tma_map_A, d_tma_map_B
+  );
 }
 
 };
