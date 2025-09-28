@@ -32,7 +32,7 @@ __device__ void warpgroup_wait() {
 }
 
 template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
-__device__ void wgmma_m64n64k16(float d[4][8], bf16 *sA, bf16 *sB) {
+__device__ void wgmma64(float d[4][8], bf16 *sA, bf16 *sB) {
   uint64_t desc_a = make_smem_desc(&sA[0]);
   uint64_t desc_b = make_smem_desc(&sB[0]);
 
@@ -128,10 +128,10 @@ matmul_kernel_v1(int M, int N, int K, bf16* C,
 
 
       warpgroup_arrive();
-      wgmma_m64n64k16<1, 1, 1, 0, 0>(d, &sA[0], &sB[0]);
-      wgmma_m64n64k16<1, 1, 1, 0, 0>(d, &sA[WGMMA_K], &sB[WGMMA_K]);
-      wgmma_m64n64k16<1, 1, 1, 0, 0>(d, &sA[2*WGMMA_K], &sB[2*WGMMA_K]);
-      wgmma_m64n64k16<1, 1, 1, 0, 0>(d, &sA[3*WGMMA_K], &sB[3*WGMMA_K]);
+      wgmma64<1, 1, 1, 0, 0>(d, &sA[0], &sB[0]);
+      wgmma64<1, 1, 1, 0, 0>(d, &sA[WGMMA_K], &sB[WGMMA_K]);
+      wgmma64<1, 1, 1, 0, 0>(d, &sA[2*WGMMA_K], &sB[2*WGMMA_K]);
+      wgmma64<1, 1, 1, 0, 0>(d, &sA[3*WGMMA_K], &sB[3*WGMMA_K]);
       warpgroup_commit_batch();
       warpgroup_wait<0>();
     }

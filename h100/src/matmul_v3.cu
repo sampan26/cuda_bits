@@ -1,6 +1,6 @@
 #include "wgmma_ops.cuh" 
 
-namespace M2 {
+namespace M3 {
 
 typedef __nv_bfloat16 bf16;
 
@@ -50,12 +50,12 @@ matmul_kernel_v3(int M, int N, int K, bf16* C,
     constexpr int num_consumers = (NUM_THREADS / 128) - 1;
     constexpr int num_wg_m = BM / num_consumers;
 
-    extern __shared__ SharedStorage<BM, BN, BK> smem;
+    extern __shared__ SharedStorage<BM, BN, BK, PIPE> smem;
     bf16 *sA = smem.A;
     bf16 *sB = smem.B;
 
     #pragma nv_diag_suppress static_var_with_dynamic_init
-    __shared__ barrier full_barrier, empty_barrier;
+    __shared__ barrier full_barrier[PIPE], empty_barrier[PIPE];
 
     const int num_tiles_k = K / BK;
     const int num_rows_n = N / BN;
@@ -77,12 +77,13 @@ matmul_kernel_v3(int M, int N, int K, bf16* C,
       constexpr int num_regs = (num_consumers <= 2 ? 24 : 32);
       int pipe_lane = 0;
       if (tid == 0) {
-        for (k_tile = 0; k_tile < num_tiles_k; ++k_tile) {
+        for (int k_tile = 0; k_tile < num_tiles_k; ++k_tile) {
           if (pipe_lane == PIPE) pipe_lane = 0;
-          empty_barrier[pipe_lane].wait(empty_barrier.arrive(pipe_lane));
+          empty_barrier[pipe_lane].wait(empty_barrier[pipe_lane].arrive());
           cde::cp_async_bulk_tensor_2d_global_to_shared(&sA[pipe_lane*BM*BK], tensorMapA, k_tile*BK, tile_m*BM, full_barrier[pipe_lane]);
-          cde::cp_async_bulk_tensor_2d_global_to_shared(&sA[pipe_lane*BM*BK], tensorMapB, k_tile*BK, tile_n*BN, full_barrier[pipe_lane]);
+          cde::cp_async_bulk_tensor_2d_global_to_shared(&sB[pipe_lane*BM*BK], tensorMapB, k_tile*BK, tile_n*BN, full_barrier[pipe_lane]);
           barrier::arrival_token _ = cuda::device::barrier_arrive_tx(full_barrier[pipe_lane], 1, (BK*BN+BK*BM)*sizeof(bf16));
+          ++pipe_lane;
         }
       }
     }
@@ -93,29 +94,29 @@ matmul_kernel_v3(int M, int N, int K, bf16* C,
       }
       float d[BM/WGMMA_M][WGMMA_N/16][8];
       memset(d, 0, sizeof(d));
-      int pipe_lane = 0
-      for (k_tile = 0; k_tile < num_tiles_k; ++k_tile) {
+      int pipe_lane = 0;
+      for (int k_tile = 0; k_tile < num_tiles_k; ++k_tile) {
         if (pipe_lane == 0) pipe_lane = 0;
         full_barrier[pipe_lane].wait(full_barrier[pipe_lane].arrive());
         warpgroup_arrive();
-        #param unroll
+        #pragma unroll
         for (int m = 0; m < BM / WGMMA_M; ++m) {
           bf16 *wg_a_tile_m = sA + pipe_lane*BM*BK + m*WGMMA_M*BK;
           #pragma unroll
           for (int k = 0; k < BK / WGMMA_K; ++k) {
-            wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m], &wg_a_tile_m[k*WGMMA_K], &sB[k*WGMMA_K]);
+            wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m], &wg_a_tile_m[k*WGMMA_K], &sB[pipe_lane*BK*BN + k*WGMMA_K]);
           }
         }
         warpgroup_commit_batch();
         warpgroup_wait<0>();
         barrier::arrival_token _ = empty_barrier[pipe_lane].arrive();
+        ++pipe_lane;
       }
 
-      tid = threadIdx.x % 128;
       int lane = tid % 32;
       int warp = tid / 32;
       int row = warp*16 + lane / 4;
-      bf16 *block_C = C + num_block_n*BN*M + num_block_m*BM;
+      bf16 *block_C = C + tile_n*BN*M + tile_m*BM;
   
       #pragma unroll
       for (int m_it = 0; m_it < BM/WGMMA_M; ++m_it) {
