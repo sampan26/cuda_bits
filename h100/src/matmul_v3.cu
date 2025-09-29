@@ -86,58 +86,58 @@ matmul_kernel_v3(int M, int N, int K, bf16* C,
         }
       }
     }
-    // else 
-    // {
-    //   for (int i = 0; i < PIPE; ++i) {
-    //     barrier::arrival_token _ = empty_barrier[i].arrive();
-    //   }
-    //   float d[BM/WGMMA_M][WGMMA_N/16][8];
-    //   memset(d, 0, sizeof(d));
-    //   int pipe_lane = 0;
-    //   for (int k_tile = 0; k_tile < num_tiles_k; ++k_tile) {
-    //     if (pipe_lane == PIPE) pipe_lane = 0;
-    //     full_barrier[pipe_lane].wait(full_barrier[pipe_lane].arrive());
-    //     warpgroup_arrive();
-    //     #pragma unroll
-    //     for (int m = 0; m < BM / WGMMA_M; ++m) {
-    //       bf16 *wg_a_tile_m = sA + pipe_lane*BM*BK + m*WGMMA_M*BK;
-    //       #pragma unroll
-    //       for (int k = 0; k < BK / WGMMA_K; ++k) {
-    //         wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m], &wg_a_tile_m[k*WGMMA_K], &sB[pipe_lane*BK*BN + k*WGMMA_K]);
-    //       }
-    //     }
-    //     warpgroup_commit_batch();
-    //     warpgroup_wait<0>();
-    //     barrier::arrival_token _ = empty_barrier[pipe_lane].arrive();
-    //     ++pipe_lane;
-    //   }
+    else 
+    {
+      for (int i = 0; i < PIPE; ++i) {
+        barrier::arrival_token _ = empty_barrier[i].arrive();
+      }
+      float d[BM/WGMMA_M][WGMMA_N/16][8];
+      memset(d, 0, sizeof(d));
+      int pipe_lane = 0;
+      for (int k_tile = 0; k_tile < num_tiles_k; ++k_tile) {
+        if (pipe_lane == PIPE) pipe_lane = 0;
+        full_barrier[pipe_lane].wait(full_barrier[pipe_lane].arrive());
+        warpgroup_arrive();
+        #pragma unroll
+        for (int m = 0; m < BM / WGMMA_M; ++m) {
+          bf16 *wg_a_tile_m = sA + pipe_lane*BM*BK + m*WGMMA_M*BK;
+          #pragma unroll
+          for (int k = 0; k < BK / WGMMA_K; ++k) {
+            wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m], &wg_a_tile_m[k*WGMMA_K], &sB[pipe_lane*BK*BN + k*WGMMA_K]);
+          }
+        }
+        warpgroup_commit_batch();
+        warpgroup_wait<0>();
+        barrier::arrival_token _ = empty_barrier[pipe_lane].arrive();
+        ++pipe_lane;
+      }
 
-    //   int lane = tid % 32;
-    //   int warp = tid / 32;
-    //   int row = warp*16 + lane / 4;
-    //   bf16 *block_C = C + tile_n*BN*M + tile_m*BM;
+      int lane = tid % 32;
+      int warp = tid / 32;
+      int row = warp*16 + lane / 4;
+      bf16 *block_C = C + tile_n*BN*M + tile_m*BM;
   
-    //   #pragma unroll
-    //   for (int m_it = 0; m_it < BM/WGMMA_M; ++m_it) {
-    //       int yo = m_it*WGMMA_M;
-    //       #pragma unroll
-    //       for (int w = 0; w < WGMMA_N/16; ++w) {
-    //           int col = 16*w + 2*(tid % 4);
-    //           #define IDX(i, j) ((j)*M + ((i) + yo))
+      #pragma unroll
+      for (int m_it = 0; m_it < BM/WGMMA_M; ++m_it) {
+          int yo = m_it*WGMMA_M;
+          #pragma unroll
+          for (int w = 0; w < WGMMA_N/16; ++w) {
+              int col = 16*w + 2*(tid % 4);
+              #define IDX(i, j) ((j)*M + ((i) + yo))
 
-    //           block_C[IDX(row, col)] = d[m_it][w][0];
-    //           block_C[IDX(row, col+1)] = d[m_it][w][1];
-    //           block_C[IDX(row+8, col)] = d[m_it][w][2];
-    //           block_C[IDX(row+8, col+1)] = d[m_it][w][3];
+              block_C[IDX(row, col)] = d[m_it][w][0];
+              block_C[IDX(row, col+1)] = d[m_it][w][1];
+              block_C[IDX(row+8, col)] = d[m_it][w][2];
+              block_C[IDX(row+8, col+1)] = d[m_it][w][3];
 
-    //           block_C[IDX(row, col+8)] = d[m_it][w][4];
-    //           block_C[IDX(row, col+9)] = d[m_it][w][5];
-    //           block_C[IDX(row+8, col+8)] = d[m_it][w][6];
-    //           block_C[IDX(row+8, col+9)] = d[m_it][w][7];
-    //           #undef IDX
-    //       }
-    //   }
-    // }
+              block_C[IDX(row, col+8)] = d[m_it][w][4];
+              block_C[IDX(row, col+9)] = d[m_it][w][5];
+              block_C[IDX(row+8, col+8)] = d[m_it][w][6];
+              block_C[IDX(row+8, col+9)] = d[m_it][w][7];
+              #undef IDX
+          }
+      }
+    }
 }
 void matmul_v3(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
   constexpr int BM = 128;
