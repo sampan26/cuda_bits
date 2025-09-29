@@ -49,9 +49,10 @@ matmul_kernel_v3(int M, int N, int K, bf16* C,
     constexpr int num_consumers = (NUM_THREADS / 128) - 1;
     constexpr int num_wg_m = BM / num_consumers;
 
-    extern __shared__ SharedStorage<BM, BN, BK, PIPE> smem;
-    bf16 *sA = smem.A;
-    bf16 *sB = smem.B;
+    extern __shared__ __align__(128) uint8_t smem[];
+    SharedStorage<BM, BN, BK, PIPE> &s = *reinterpret_cast<SharedStorage<BM, BN, BK, PIPE>*>(smem);
+    bf16 *sA = s.A;
+    bf16 *sB = s.B;
 
     #pragma nv_diag_suppress static_var_with_dynamic_init
     __shared__ barrier full_barrier[PIPE], empty_barrier[PIPE];
