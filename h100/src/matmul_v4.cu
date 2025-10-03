@@ -28,10 +28,20 @@ template <int BlockMajorSize, int BlockMinorSize>
 __host__ static inline CUtensorMap* init_tensor_map(bf16* src, int shape_major, int shape_minor) {
   CUtensorMap *tma_map_d;
   cudaMalloc(&tma_map_d, sizeof(CUtensorMap));
-  CUtensorMap tma_map_h;  // Fixed: declare as value
+  CUtensorMap tma_map_h; 
   create_tensor_map<BlockMajorSize, BlockMinorSize>(&tma_map_h, src, shape_major, shape_minor);
   cudaMemcpy(tma_map_d, &tma_map_h, sizeof(CUtensorMap), cudaMemcpyHostToDevice);  // Fixed: use tma_map_h
   return tma_map_d;
+}
+
+template <uint32_t RegCount>
+__device__ void warpgroup_reg_alloc() {
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(RegCount));
+}
+
+template <uint32_t RegCount>
+__device__ void warpgroup_reg_dealloc() {
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount));
 }
 
 template <int BM, int BN, int BK, int PIPE>
@@ -76,9 +86,9 @@ matmul_kernel_v4(int M, int N, int K, bf16* C,
     if (wg_idx == 0) 
     {
       constexpr int num_regs = (num_consumers <= 2 ? 24 : 32);
-      asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(24));
-      int pipe_lane = 0;
+      warpgroup_reg_dealloc<num_regs>();
       if (tid == 0) {
+        int pipe_lane = 0;
         for (int k_tile = 0; k_tile < num_tiles_k; ++k_tile, ++pipe_lane) {
           if (pipe_lane == PIPE) pipe_lane = 0;
           empty_barrier[pipe_lane].wait(empty_barrier[pipe_lane].arrive());
@@ -90,7 +100,8 @@ matmul_kernel_v4(int M, int N, int K, bf16* C,
     }
     else 
     {
-      asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(240));
+      constexpr int num_regs = (num_consumers == 1 ? 256 : (num_consumers == 2 ? 240 : 160));
+      warpgroup_reg_alloc<num_regs>();
       
       for (int i = 0; i < PIPE; ++i) {
         barrier::arrival_token _ = empty_barrier[i].arrive();
@@ -106,8 +117,8 @@ matmul_kernel_v4(int M, int N, int K, bf16* C,
         full_barrier[pipe_lane].wait(full_barrier[pipe_lane].arrive());
         warpgroup_arrive();
         #pragma unroll
-        for (int m = 0; m < BM / WGMMA_M; ++m) {
-          bf16 *wgmma_sA = sA + pipe_lane*BM*BK + BK*(m + wg_idx*wg_m/WGMMA_M)*WGMMA_M;
+        for (int m = 0; m < wg_m / WGMMA_M; ++m) {
+          bf16 *wgmma_sA = sA + pipe_lane*BM*BK + BK*m*WGMMA_M + wg_idx*wg_m*BK;
           #pragma unroll
           for (int k = 0; k < BK / WGMMA_K; ++k) {
             wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m], &wgmma_sA[k*WGMMA_K], &sB[pipe_lane*BK*BN + k*WGMMA_K]);

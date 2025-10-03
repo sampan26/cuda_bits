@@ -86,7 +86,6 @@ __device__ __forceinline__ void wgmma_m64n256k16(float d[16][8], bf16* sA, bf16*
         : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)), "n"(int32_t(ScaleA)),
             "n"(int32_t(ScaleB)), "n"(int32_t(TransA)), "n"(int32_t(TransB)));
 }
-
 template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
 __device__ __forceinline__ void wgmma_m64n128k16(float d[8][8], bf16* sA, bf16* sB) {
     uint64_t desc_a = make_smem_desc(&sA[0]);
