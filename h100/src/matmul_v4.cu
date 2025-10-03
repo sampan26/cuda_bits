@@ -30,6 +30,15 @@ __host__ static inline CUtensorMap* init_tensor_map(bf16* src, int shape_major, 
   return tma_map_d;
 }
 
+__device__ void warpgroup_reg_alloc() {
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(RegCount));
+}
+
+template <uint32_t RegCount>
+__device__ void warpgroup_reg_dealloc() {
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount));
+}
+
 template <int BM, int BN, int BK, int PIPE>
 struct SharedStorage {
   alignas(128) bf16 A[BM*BK*PIPE];
