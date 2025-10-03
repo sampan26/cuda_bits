@@ -18,6 +18,7 @@
 #include "src/matmul_v1.cu"
 #include "src/matmul_v2.cu"
 #include "src/matmul_v3.cu"
+#include "src/matmul_v4.cu"
 
 typedef __nv_bfloat16 bf16;
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
@@ -118,7 +119,7 @@ int main() {
     cudaCheck(cudaMemcpy(dA, A, sizeof(bf16) * max_size * max_size, cudaMemcpyHostToDevice));
     cudaCheck(cudaMemcpy(dB, B, sizeof(bf16) * max_size * max_size, cudaMemcpyHostToDevice));
 
-    for (int kernel_num : {0, 1, 2, 3}) {
+    for (int kernel_num : {0, 1, 2, 3, 4}) {
         // Give the GPU some rest to avoid thermal throttling
         sleep(5);
         std::cout << "KERNEL " << kernel_num << std::endl;
