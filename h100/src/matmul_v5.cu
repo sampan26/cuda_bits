@@ -1,6 +1,6 @@
 #include "wgmma_ops.cuh"
 
-namespace M4 {
+namespace M5 {
 
 typedef __nv_bfloat16 bf16;
 
@@ -87,11 +87,11 @@ matmul_kernel_v5(int M, int N, int K, bf16* C, const CUtensorMap* tensorMapA, co
     
     if (tid == 0) {
       int pipe_lane = 0;
-      for (tile_idx = blockIdx.x; tile_idx < num_blocks; tile_idx+=NUM_SM) {
+      for (int tile_idx = blockIdx.x; tile_idx < num_blocks; tile_idx+=NUM_SM) {
         int group_idx = tile_idx / tiles_in_group;
         int tile_idx_in_group = tile_idx % tiles_in_group;
         int group_m = group_idx / (num_blocks_n / group_size_n);
-        int group_n = group_idx / (num_blocks_n / group_size_n);
+        int group_n = group_idx % (num_blocks_n / group_size_n);
         int tile_group_m = tile_idx_in_group / group_size_n;
         int tile_group_n = tile_idx_in_group % group_size_n;
         int tile_m = group_m * group_size_m + tile_group_m;
@@ -121,7 +121,7 @@ matmul_kernel_v5(int M, int N, int K, bf16* C, const CUtensorMap* tensorMapA, co
       int group_idx = tile_idx / tiles_in_group;
       int tile_idx_in_group = tile_idx % tiles_in_group;
       int group_m = group_idx / (num_blocks_n / group_size_n);
-      int group_n = group_idx / (num_blocks_n / group_size_n);
+      int group_n = group_idx % (num_blocks_n / group_size_n);
       int tile_group_m = tile_idx_in_group / group_size_n;
       int tile_group_n = tile_idx_in_group % group_size_n;
       int tile_m = group_m * group_size_m + tile_group_m;
@@ -175,7 +175,7 @@ matmul_kernel_v5(int M, int N, int K, bf16* C, const CUtensorMap* tensorMapA, co
 
 void matmul_v5(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
   constexpr int BM = 128;
-  constexpr int BN = 128;
+  constexpr int BN = 256;
   constexpr int BK = 64;
   constexpr int NUM_THREADS = 128 * 3;
   constexpr int PIPE = 3;
@@ -183,7 +183,7 @@ void matmul_v5(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
   d_tma_map_A = init_tensor_map<BM, BK>(A, M, K);
   d_tma_map_B = init_tensor_map<BN, BK>(B, N, K);
 
-  auto* kernel = matmul_kernel_v4<BM,BN,BK,NUM_THREADS,PIPE,NUM_SM>;
+  auto* kernel = matmul_kernel_v5<BM,BN,BK,NUM_THREADS,PIPE,NUM_SM>;
   size_t smem_size = sizeof(SharedStorage<BM, BN, BK, PIPE>);
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
   kernel<<<NUM_SM, NUM_THREADS, smem_size>>>(M, N, K, C, d_tma_map_A, d_tma_map_B);

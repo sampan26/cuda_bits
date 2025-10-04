@@ -30,6 +30,7 @@ __host__ static inline CUtensorMap* init_tensor_map(bf16* src, int shape_major, 
   return tma_map_d;
 }
 
+template <uint32_t RegCount>
 __device__ void warpgroup_reg_alloc() {
     asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(RegCount));
 }
