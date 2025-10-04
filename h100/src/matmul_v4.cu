@@ -1,4 +1,4 @@
-#include "wgmma_ops.cuh"
+#include "ptx.cuh"
 
 namespace M4 {
 
