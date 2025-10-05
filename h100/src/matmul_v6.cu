@@ -1,10 +1,11 @@
 #include "ptx.cuh"
 
-namespace M4 {
+namespace M5 {
 
 typedef __nv_bfloat16 bf16;
 
-\namespace cde = cuda::device::experimental;
+using barrier = cuda::barrier<cuda::thread_scope_block>;
+namespace cde = cuda::device::experimental;
 
 template <int BlockMajorSize, int BlockMinorSize>
 void create_tensor_map(CUtensorMap* tma_map, bf16 *src, int shape_major, int shape_minor) {
@@ -31,12 +32,12 @@ __host__ static inline CUtensorMap* init_tensor_map(bf16* src, int shape_major, 
 
 template <uint32_t RegCount>
 __device__ void warpgroup_reg_alloc() {
-    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(RegCount));
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(RegCount));
 }
 
 template <uint32_t RegCount>
 __device__ void warpgroup_reg_dealloc() {
-    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount));
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount));
 }
 
 template <int BM, int BN, int BK, int PIPE>
@@ -45,16 +46,15 @@ struct SharedStorage {
     alignas(128) bf16 B[BK*BN*PIPE];
 };
 
-__device__ __forceinline__ auto compute_tile_coords(int tile_idx, int tiles_in_group, int num_blocks_n, int group_size_m, int group_size_n) {
+__device__ void calculate_tile_indices(int tile_idx, int num_blocks_n, int group_size_m, int group_size_n, int tiles_in_group, int& tile_m, int& tile_n) {
     int group_idx = tile_idx / tiles_in_group;
     int tile_idx_in_group = tile_idx % tiles_in_group;
     int group_m = group_idx / (num_blocks_n / group_size_n);
-    int group_n = group_idx / (num_blocks_n / group_size_n);
+    int group_n = group_idx % (num_blocks_n / group_size_n);
     int tile_group_m = tile_idx_in_group / group_size_n;
     int tile_group_n = tile_idx_in_group % group_size_n;
-    int tile_m = group_m * group_size_m + tile_group_m;
-    int tile_n = group_n * group_size_n + tile_group_n;
-    return std::make_pair(tile_m, tile_n);
+    tile_m = group_m * group_size_m + tile_group_m;
+    tile_n = group_n * group_size_n + tile_group_n;
 }
 
 template<int BM, int BN, int BK, int NUM_THREADS, int PIPE, int NUM_SM>
@@ -70,7 +70,7 @@ matmul_kernel_v5(int M, int N, int K, bf16* C, const CUtensorMap* tensorMapA, co
     bf16 *sB = s.B;
 
     #pragma nv_diag_suppress static_var_with_dynamic_init
-    __shared__ alignas(8) uint64_t full_barrier[PIPE], empty_barrier[PIPE];
+    __shared__ __align__(8) uint64_t full_barrier[PIPE], empty_barrier[PIPE];
 
     const int num_tiles_k = K / BK;
     const int num_blocks_m = M / BM;
@@ -85,10 +85,9 @@ matmul_kernel_v5(int M, int N, int K, bf16* C, const CUtensorMap* tensorMapA, co
 
     if (threadIdx.x == 0) {
         for (int i = 0; i < PIPE; ++i) {
-            init_barrier(&full_barrier[i], 1, 0);
-            init_barrier(&empty_barrier[i], num_consumers, 0);
+            init_barriers(&full_barrier[i], 1);
+            init_barriers(&empty_barrier[i], num_consumers);
         }
-        cde::fence_proxy_async_shared_cta();
     }
     __syncthreads();
 
@@ -98,20 +97,23 @@ matmul_kernel_v5(int M, int N, int K, bf16* C, const CUtensorMap* tensorMapA, co
         
         if (tid == 0) {
             int pipe_lane = 0;
-            for (tile_idx = blockIdx.x; tile_idx < num_blocks; tile_idx+=NUM_SM) {
-                auto [tile_m, tile_n] = compute_tile_coords(tile_idx, tiles_in_group, num_blocks_n, group_size_m, group_size_n);
+            int p = 0;
+            int tile_m, tile_n;
 
+            for (int tile_idx = blockIdx.x; tile_idx < num_blocks; tile_idx+=NUM_SM) {
+                calculate_tile_indices(tile_idx, num_blocks_n, group_size_m, group_size_n, tiles_in_group, tile_m, tile_n);
                 for (int k_tile = 0; k_tile < num_tiles_k; ++k_tile, ++pipe_lane) {
-                    if (pipe_lane == PIPE) pipe_lane = 0;
-                    
-                    empty_barrier[pipe_lane].wait(empty_barrier[pipe_lane].arrive());
-                    cde::cp_async_bulk_tensor_2d_global_to_shared(&sA[pipe_lane*BM*BK], tensorMapA, k_tile*BK, tile_m*BM, full_barrier[pipe_lane]);
-                    cde::cp_async_bulk_tensor_2d_global_to_shared(&sB[pipe_lane*BN*BK], tensorMapB, k_tile*BK, tile_n*BN, full_barrier[pipe_lane]);
-                    barrier::arrival_token _ = cuda::device::barrier_arrive_tx(full_barrier[pipe_lane], 1, (BK*BN+BK*BM)*sizeof(bf16));
+                    if (pipe_lane == PIPE) {pipe_lane = 0; p ^= 1}
+                    wait(&empty_barrier[pipe_lane], p);
+                    expect_bytes(&full_barrier[pipe_lane], (BK*BN+BK*BM)*sizeof(bf16));
+                    load_async(&sA[pipe_lane*BM*BK], &tensorMapA, full_barrier[pipe_lane], k_tile*BK, tile_m*BM);
+                    load_async(&sB[pipe_lane*BN*BK], &tensorMapB, full_barrier[pipe_lane], k_tile*BK, tile_n*BN);
+                    arrive(&full_barrier[pipe_lane], 1);
                 }
             }
         }
-      } else {
+      }
+      else {
         constexpr int num_regs = (num_consumers == 1 ? 256 : (num_consumers == 2 ? 240 : 160));
         warpgroup_reg_alloc<num_regs>();
         float d[B_WG_M/WGMMA_M][WGMMA_N/16][8];
@@ -119,28 +121,30 @@ matmul_kernel_v5(int M, int N, int K, bf16* C, const CUtensorMap* tensorMapA, co
         --wg_idx;
 
         for (int i = 0; i < PIPE; ++i) {
-            barrier::arrival_token _ = empty_barrier[i].arrive();
+            if (tid == 0) arrive(&empty_barrier[i], 1);
         }
         int pipe_lane = 0;
+        int p = 0;
+        int tile_m, tile_n;
         for (int tile_idx = blockIdx.x; tile_idx < num_blocks; tile_idx+=gridDim.x) {
-            auto [tile_m, tile_n] = compute_tile_coords(tile_idx, tiles_in_group, num_blocks_n, group_size_m, group_size_n);
+            calculate_tile_indices(tile_idx, num_blocks_n, group_size_m, group_size_n, tiles_in_group, tile_m, tile_n);
             memset(d, 0, sizeof(d));
-
             for (int k_tile = 0; k_tile < num_tiles_k; ++k_tile, ++pipe_lane) {
-                if (pipe_lane == PIPE) pipe_lane = 0;
-                full_barrier[pipe_lane].wait(full_barrier[pipe_lane].arrive());
+                if (pipe_lane == PIPE) {pipe_lane = 0; p ^= 1; }
+                wati(&full_barrier[pipe_lane], p);
                 warpgroup_arrive();
                 #pragma unroll
                 for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
                     bf16 *wgmma_sA = sA + pipe_lane*BM*BK + BK*WGMMA_M*(m_it + wg_idx*(B_WG_M/WGMMA_M));
+                    bf16 *wgmma_sB = sB + pipe_lane*BK*BN;
                     #pragma unroll
                     for (int k_it = 0; k_it < BK / WGMMA_K; ++k_it) {
-                        wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it*WGMMA_K], &sB[pipe_lane*BK*BN + k_it*WGMMA_K]);
+                        wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it*WGMMA_K], &wgmma_sB[k_it*WGMMA_K]);
                     }
                 }
                 warpgroup_commit_batch();
                 warpgroup_wait<0>();
-                barrier::arrival_token _ = empty_barrier[pipe_lane].arrive();
+                if (tid == 0) arrive(&empty_barrier[pipe_lane], 1);
             }
         
 
@@ -173,7 +177,7 @@ matmul_kernel_v5(int M, int N, int K, bf16* C, const CUtensorMap* tensorMapA, co
 
 void matmul_v5(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     constexpr int BM = 128;
-    constexpr int BN = 128;
+    constexpr int BN = 256;
     constexpr int BK = 64;
     constexpr int NUM_THREADS = 128 * 3;
     constexpr int PIPE = 3;
@@ -181,7 +185,7 @@ void matmul_v5(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     d_tma_map_A = init_tensor_map<BM, BK>(A, M, K);
     d_tma_map_B = init_tensor_map<BN, BK>(B, N, K);
 
-    auto* kernel = matmul_kernel_v4<BM,BN,BK,NUM_THREADS,PIPE,NUM_SM>;
+    auto* kernel = matmul_kernel_v5<BM,BN,BK,NUM_THREADS,PIPE,NUM_SM>;
     size_t smem_size = sizeof(SharedStorage<BM, BN, BK, PIPE>);
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     kernel<<<NUM_SM, NUM_THREADS, smem_size>>>(M, N, K, C, d_tma_map_A, d_tma_map_B);

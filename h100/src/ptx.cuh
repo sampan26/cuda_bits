@@ -2,11 +2,10 @@
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
-#include <cuda/pipeline>   // for cuda::barrier (requires CUDA 12+)
+#include <cuda/pipeline>  
 
 using bf16 = __nv_bfloat16;
 
-using barrier = cuda::barrier<cuda::thread_scope_block>;
 namespace cde = cuda::device::experimental;
 
 // --- shared-mem matrix descriptor helpers -----------------------------------
@@ -23,6 +22,63 @@ __device__ inline uint64_t make_smem_desc(bf16* ptr) {
   desc |= matrix_descriptor_encode((uint64_t)1024)<< 32;  // stride (adjust as needed)
   desc |= 1ull << 62;                                     // “smem” bit
   return desc;
+}
+
+// --- barrier helpers -----------------------------------
+__device__ __static__ __forceinline__ void init_barriers(uint64_t* bar, int thread_count) {
+  uint32_t bar_addr = reinterpret_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile(
+    "mbarrier.init.shared::cta.b64 [%0], %1;\n"
+    :: "r"(bar_addr), "r"(thread_count)
+  );
+}
+
+__device__ static __forceinline__ void wait(uint64_t* bar, int kPhaseBit) {
+    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar)); 
+    asm volatile (
+        "{\n"
+        ".reg .pred                P1;\n"
+        "LAB_WAIT:\n"
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [%0], %1;\n"
+        "@P1                       bra.uni DONE;\n"
+        "bra.uni                   LAB_WAIT;\n"
+        "DONE:\n"
+        "}\n"
+        :: "r"(mbar_ptr),
+        "r"(kPhaseBit)
+    );
+}
+
+__device__ static __forceinline__ void expect_bytes(uint64_t* mbar, uint32_t bytes) {
+    asm volatile(
+        "mbarrier.expect_tx.relaxed.cta.shared::cta.b64 _, [%0], %1;\n"
+        ::"r"(mbar), "r"(bytes)
+    );
+}
+
+__device__ static inline void load_async(bf16 *dst, void const* const src_tma_map, uint64_t* bar, int global_col_idx, int global_row_idx) {
+    uint64_t tma_ptr  = reinterpret_cast<uint64_t>(src_tma_map);
+    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    uint32_t dst_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+
+    asm volatile (
+        "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
+        " [%0], [%1, {%3, %4, %5, 0, 0}], [%2];"
+        :
+        : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr),
+        "n"(0), "r"(global_row_idx), "r"(global_col_idx/64)
+        : "memory"
+    );
+}
+
+__device__ static __forceinline__ void arrive(uint64_t* bar, uint32_t count=1) {
+    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar)); 
+    asm volatile (
+        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0], %1;\n"
+        :
+        : "r"(mbar_ptr), "r"(count)
+        : "memory"
+    );
 }
 
 // --- warpgroup flow helpers --------------------------------------------------
