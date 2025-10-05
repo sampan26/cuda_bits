@@ -1,6 +1,6 @@
 #include "ptx.cuh"
 
-namespace M5 {
+namespace M6 {
 
 typedef __nv_bfloat16 bf16;
 
@@ -59,7 +59,7 @@ __device__ void calculate_tile_indices(int tile_idx, int num_blocks_n, int group
 
 template<int BM, int BN, int BK, int NUM_THREADS, int PIPE, int NUM_SM>
 __global__ void __launch_bounds__(NUM_THREADS)
-matmul_kernel_v5(int M, int N, int K, bf16* C, const CUtensorMap* tensorMapA, const CUtensorMap* tensorMapB) {
+matmul_kernel_v6(int M, int N, int K, bf16* C, const CUtensorMap* tensorMapA, const CUtensorMap* tensorMapB) {
     constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N = BN;
     constexpr int num_consumers = (NUM_THREADS / 128) - 1;
     constexpr int B_WG_M = BM / num_consumers;
@@ -103,11 +103,11 @@ matmul_kernel_v5(int M, int N, int K, bf16* C, const CUtensorMap* tensorMapA, co
             for (int tile_idx = blockIdx.x; tile_idx < num_blocks; tile_idx+=NUM_SM) {
                 calculate_tile_indices(tile_idx, num_blocks_n, group_size_m, group_size_n, tiles_in_group, tile_m, tile_n);
                 for (int k_tile = 0; k_tile < num_tiles_k; ++k_tile, ++pipe_lane) {
-                    if (pipe_lane == PIPE) {pipe_lane = 0; p ^= 1}
+                    if (pipe_lane == PIPE) {pipe_lane = 0; p ^= 1; }
                     wait(&empty_barrier[pipe_lane], p);
                     expect_bytes(&full_barrier[pipe_lane], (BK*BN+BK*BM)*sizeof(bf16));
-                    load_async(&sA[pipe_lane*BM*BK], &tensorMapA, full_barrier[pipe_lane], k_tile*BK, tile_m*BM);
-                    load_async(&sB[pipe_lane*BN*BK], &tensorMapB, full_barrier[pipe_lane], k_tile*BK, tile_n*BN);
+                    load_async(&sA[pipe_lane*BM*BK], &tensorMapA, &full_barrier[pipe_lane], k_tile*BK, tile_m*BM);
+                    load_async(&sB[pipe_lane*BN*BK], &tensorMapB, &full_barrier[pipe_lane], k_tile*BK, tile_n*BN);
                     arrive(&full_barrier[pipe_lane], 1);
                 }
             }
@@ -131,7 +131,7 @@ matmul_kernel_v5(int M, int N, int K, bf16* C, const CUtensorMap* tensorMapA, co
             memset(d, 0, sizeof(d));
             for (int k_tile = 0; k_tile < num_tiles_k; ++k_tile, ++pipe_lane) {
                 if (pipe_lane == PIPE) {pipe_lane = 0; p ^= 1; }
-                wati(&full_barrier[pipe_lane], p);
+                wait(&full_barrier[pipe_lane], p);
                 warpgroup_arrive();
                 #pragma unroll
                 for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
@@ -175,7 +175,7 @@ matmul_kernel_v5(int M, int N, int K, bf16* C, const CUtensorMap* tensorMapA, co
     }
 }
 
-void matmul_v5(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
+void matmul_v6(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     constexpr int BM = 128;
     constexpr int BN = 256;
     constexpr int BK = 64;
@@ -185,7 +185,7 @@ void matmul_v5(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     d_tma_map_A = init_tensor_map<BM, BK>(A, M, K);
     d_tma_map_B = init_tensor_map<BN, BK>(B, N, K);
 
-    auto* kernel = matmul_kernel_v5<BM,BN,BK,NUM_THREADS,PIPE,NUM_SM>;
+    auto* kernel = matmul_kernel_v6<BM,BN,BK,NUM_THREADS,PIPE,NUM_SM>;
     size_t smem_size = sizeof(SharedStorage<BM, BN, BK, PIPE>);
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     kernel<<<NUM_SM, NUM_THREADS, smem_size>>>(M, N, K, C, d_tma_map_A, d_tma_map_B);
@@ -193,4 +193,4 @@ void matmul_v5(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
 
 }
 
-using M5::matmul_v5;
+using M6::matmul_v6;

@@ -25,8 +25,8 @@ __device__ inline uint64_t make_smem_desc(bf16* ptr) {
 }
 
 // --- barrier helpers -----------------------------------
-__device__ __static__ __forceinline__ void init_barriers(uint64_t* bar, int thread_count) {
-  uint32_t bar_addr = reinterpret_cast<uint32_t>(__cvta_generic_to_shared(bar));
+__device__ static __forceinline__ void init_barriers(uint64_t* bar, int thread_count) {
+  uint32_t bar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
   asm volatile(
     "mbarrier.init.shared::cta.b64 [%0], %1;\n"
     :: "r"(bar_addr), "r"(thread_count)
@@ -50,10 +50,11 @@ __device__ static __forceinline__ void wait(uint64_t* bar, int kPhaseBit) {
 }
 
 __device__ static __forceinline__ void expect_bytes(uint64_t* mbar, uint32_t bytes) {
-    asm volatile(
-        "mbarrier.expect_tx.relaxed.cta.shared::cta.b64 _, [%0], %1;\n"
-        ::"r"(mbar), "r"(bytes)
-    );
+    uint32_t mbar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar));
+    asm volatile (
+      "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;\n"
+      :: "r"(mbar_addr), "r"(bytes)
+  );
 }
 
 __device__ static inline void load_async(bf16 *dst, void const* const src_tma_map, uint64_t* bar, int global_col_idx, int global_row_idx) {
@@ -142,6 +143,7 @@ __device__ __forceinline__ void wgmma_m64n256k16(float d[16][8], bf16* sA, bf16*
         : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)), "n"(int32_t(ScaleA)),
             "n"(int32_t(ScaleB)), "n"(int32_t(TransA)), "n"(int32_t(TransB)));
 }
+
 template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
 __device__ __forceinline__ void wgmma_m64n128k16(float d[8][8], bf16* sA, bf16* sB) {
     uint64_t desc_a = make_smem_desc(&sA[0]);
