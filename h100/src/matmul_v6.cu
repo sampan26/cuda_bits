@@ -8,27 +8,27 @@ using barrier = cuda::barrier<cuda::thread_scope_block>;
 namespace cde = cuda::device::experimental;
 
 template <int BlockMajorSize, int BlockMinorSize>
-void create_tensor_map(CUtensorMap* tma_map, bf16 *src, int shape_major, int shape_minor) {
-    void *src_addr = (void*)src;
-    uint64_t gmem_prob_shape[5] = {(uint64_t)shape_minor, (uint64_t)shape_major, 1, 1, 1};
-    uint64_t gmem_prob_stride[5] = {sizeof(bf16), sizeof(bf16) * shape_minor, 0, 0, 0};
-    uint32_t smem_box_shape[5] = {(uint32_t)BlockMinorSize, (uint32_t)BlockMajorSize, 1, 1, 1};
+__host__ static inline CUtensorMap create_tensor_map(bf16* gmem_ptr, int global_height, int global_width) {
+    CUtensorMap tma_map;
+    void* gmem_address = (void*)gmem_ptr;
+    static_assert(BlockMinorSize >= 64);
+    assert(global_width % 64 == 0);
+    uint64_t gmem_prob_shape[5] = {64, (uint64_t)global_height, (uint64_t)global_width/64, 1, 1};
+    uint64_t gmem_prob_stride[5] = {sizeof(bf16) * global_width, 64*sizeof(bf16), 0, 0, 0};
+    uint32_t smem_box_shape[5] = {64, uint32_t(BlockMajorSize), uint32_t(BlockMinorSize/64), 1, 1};
     uint32_t smem_box_stride[5] = {1, 1, 1, 1, 1};
-    CUresult result = cuTensorMapEncodeTiled(tma_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, src_addr, gmem_prob_shape, gmem_prob_stride + 1, smem_box_shape, smem_box_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+
+    CUresult result = cuTensorMapEncodeTiled(
+        &tma_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 5, gmem_address, gmem_prob_shape,
+        gmem_prob_stride, smem_box_shape, smem_box_stride, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+
+    assert(result == CUDA_SUCCESS);
+    return tma_map;
 }
 
-CUtensorMap *d_tma_map_A = 0;
-CUtensorMap *d_tma_map_B = 0;
-
-template <int BlockMajorSize, int BlockMinorSize>
-__host__ static inline CUtensorMap* init_tensor_map(bf16* src, int shape_major, int shape_minor) {
-    CUtensorMap *tma_map_d;
-    cudaMalloc(&tma_map_d, sizeof(CUtensorMap));
-    CUtensorMap tma_map_h;
-    create_tensor_map<BlockMajorSize, BlockMinorSize>(&tma_map_h, src, shape_major, shape_minor);
-    cudaMemcpy(tma_map_d, &tma_map_h, sizeof(CUtensorMap), cudaMemcpyHostToDevice);
-    return tma_map_d;
-}
+CUtensorMap d_tma_map_A;
+CUtensorMap d_tma_map_B;
 
 template <uint32_t RegCount>
 __device__ void warpgroup_reg_alloc() {
@@ -59,7 +59,7 @@ __device__ void calculate_tile_indices(int tile_idx, int num_blocks_n, int group
 
 template<int BM, int BN, int BK, int NUM_THREADS, int PIPE, int NUM_SM>
 __global__ void __launch_bounds__(NUM_THREADS)
-matmul_kernel_v6(int M, int N, int K, bf16* C, const CUtensorMap* tensorMapA, const CUtensorMap* tensorMapB) {
+matmul_kernel_v6(int M, int N, int K, bf16* C, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB) {
     constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N = BN;
     constexpr int num_consumers = (NUM_THREADS / 128) - 1;
     constexpr int B_WG_M = BM / num_consumers;
@@ -126,7 +126,7 @@ matmul_kernel_v6(int M, int N, int K, bf16* C, const CUtensorMap* tensorMapA, co
         int pipe_lane = 0;
         int p = 0;
         int tile_m, tile_n;
-        for (int tile_idx = blockIdx.x; tile_idx < num_blocks; tile_idx+=gridDim.x) {
+        for (int tile_idx = blockIdx.x; tile_idx < num_blocks; tile_idx+=NUM_SM) {
             calculate_tile_indices(tile_idx, num_blocks_n, group_size_m, group_size_n, tiles_in_group, tile_m, tile_n);
             memset(d, 0, sizeof(d));
             for (int k_tile = 0; k_tile < num_tiles_k; ++k_tile, ++pipe_lane) {
@@ -182,8 +182,8 @@ void matmul_v6(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     constexpr int NUM_THREADS = 128 * 3;
     constexpr int PIPE = 3;
     constexpr int NUM_SM = 128;
-    d_tma_map_A = init_tensor_map<BM, BK>(A, M, K);
-    d_tma_map_B = init_tensor_map<BN, BK>(B, N, K);
+    d_tma_map_A = create_tensor_map<BM, BK>(A, M, K);
+    d_tma_map_B = create_tensor_map<BN, BK>(B, N, K);
 
     auto* kernel = matmul_kernel_v6<BM,BN,BK,NUM_THREADS,PIPE,NUM_SM>;
     size_t smem_size = sizeof(SharedStorage<BM, BN, BK, PIPE>);
