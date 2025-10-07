@@ -56,7 +56,7 @@ __device__ void calculate_tile_indices(int tile_idx, int num_blocks_n, int group
 
 template<int BM, int BN, int BK, int NUM_THREADS, int PIPE, int NUM_SM, int CLUSTER_M, int CLUSTER_N>
 __global__  __launch_bounds__(NUM_THREADS) 
-void __cluster_dim__(CLUSTER_M * CLUSTER_N, 1, 1)
+void __cluster_dims__(CLUSTER_M * CLUSTER_N, 1, 1)
 matmul_kernel_v7(int M, int N, int K, bf16* C, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB) {
     constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N = BN;
     constexpr int num_consumers = (NUM_THREADS / 128) - 1;
@@ -70,7 +70,7 @@ matmul_kernel_v7(int M, int N, int K, bf16* C, const __grid_constant__ CUtensorM
 
     __shared__ __align__(8) uint64_t full_barrier[PIPE], empty_barrier[PIPE];
     uint32_t cluster_id, rank;
-    asm volatile("mov.u32 %0, %clusterid.x;\n" : "r"(cluster_id) :);
+    asm volatile("mov.u32 %0, %clusterid.x;\n" : "=r"(cluster_id) :);
 
     const int num_tiles_k = K / BK;
     const int num_blocks_m = M / (BM * CLUSTER_M);
@@ -130,7 +130,7 @@ matmul_kernel_v7(int M, int N, int K, bf16* C, const __grid_constant__ CUtensorM
 
                     if constexpr (CLUSTER_M > 1) {
                         if (rank_m == 0) {
-                            load_async_multi(&sB[pipe_lane*BM*BK], &tensorMapB, &full_barrier[pipe_lane], k_tile*BK, tile_n*BN, col_mask);
+                            load_async_multi(&sB[pipe_lane*BN*BK], &tensorMapB, &full_barrier[pipe_lane], k_tile*BK, tile_n*BN, col_mask << rank_n);
                         }
                     } else {
                         load_async_3d(&sB[pipe_lane*BN*BK], &tensorMapB, &full_barrier[pipe_lane], k_tile*BK, tile_n*BN);
@@ -148,12 +148,12 @@ matmul_kernel_v7(int M, int N, int K, bf16* C, const __grid_constant__ CUtensorM
         --wg_idx;
 
         for (int i = 0; i < PIPE; ++i) {
-            if (tid == 0) arrive(&empty_barrier[i], 1);
+            if (tid < CLUSTERS) arrive_cluster(&empty_barrier[i], tid);
         }
         int pipe_lane = 0;
         int p = 0;
         int tile_m, tile_n;
-        for (int tile_idx = blockIdx.x; tile_idx < num_blocks; tile_idx+=NUM_SM) {
+        for (int tile_idx = cluster_id; tile_idx < num_blocks; tile_idx+=NUM_SM/CLUSTERS) {
             calculate_tile_indices(tile_idx, num_blocks_n, group_size_m, group_size_n, tiles_in_group, tile_m, tile_n);
             tile_m = tile_m * CLUSTER_M + rank_m;
             tile_n = tile_n * CLUSTER_N + rank_n;

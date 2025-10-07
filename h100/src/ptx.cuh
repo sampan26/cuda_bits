@@ -110,11 +110,11 @@ __device__ static inline void load_async_multi(bf16 *dst, void const* const src_
   uint32_t dst_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
 
   asm volatile (
-      "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster"
+      "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster"
       " [%0], [%1, {%3, %4, %5, 0, 0}], [%2], %6;"
       :
       : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr),
-      "n"(0), "r"(global_row_idx), "r"(global_col_idx/64), "r"(mask)
+      "n"(0), "r"(global_row_idx), "r"(global_col_idx/64), "h"(mask)
       : "memory"
   );
 }
@@ -130,7 +130,7 @@ __device__ static __forceinline__ void arrive(uint64_t* bar, uint32_t count=1) {
     );
 }
 
-__device__ static __forceinline__ void arrive(uint64_t* bar, uint32_t cta_id, uint32_t count=1) {
+__device__ static __forceinline__ void arrive_cluster(uint64_t* bar, uint32_t cta_id, uint32_t count=1) {
   uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar)); 
   asm volatile (
       "{\n\t"
