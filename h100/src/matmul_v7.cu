@@ -1,11 +1,8 @@
 #include "ptx.cuh"
 
-namespace M6 {
+namespace M7 {
 
 typedef __nv_bfloat16 bf16;
-
-using barrier = cuda::barrier<cuda::thread_scope_block>;
-namespace cde = cuda::device::experimental;
 
 template <int BlockMajorSize, int BlockMinorSize>
 __host__ static inline CUtensorMap create_tensor_map(bf16* gmem_ptr, int global_height, int global_width) {
@@ -19,7 +16,7 @@ __host__ static inline CUtensorMap create_tensor_map(bf16* gmem_ptr, int global_
     uint32_t smem_box_stride[5] = {1, 1, 1, 1, 1};
 
     CUresult result = cuTensorMapEncodeTiled(
-        &tma_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 5, gmem_address, gmem_prob_shape,
+        &tma_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, gmem_address, gmem_prob_shape,
         gmem_prob_stride, smem_box_shape, smem_box_stride, CU_TENSOR_MAP_INTERLEAVE_NONE,
         CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
@@ -57,39 +54,47 @@ __device__ void calculate_tile_indices(int tile_idx, int num_blocks_n, int group
     tile_n = group_n * group_size_n + tile_group_n;
 }
 
-template<int BM, int BN, int BK, int NUM_THREADS, int PIPE, int NUM_SM>
-__global__ void __launch_bounds__(NUM_THREADS)
-matmul_kernel_v6(int M, int N, int K, bf16* C, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB) {
+template<int BM, int BN, int BK, int NUM_THREADS, int PIPE, int NUM_SM, int CLUSTER_M, int CLUSTER_N>
+__global__  __launch_bounds__(NUM_THREADS) 
+void __cluster_dim__(CLUSTER_M * CLUSTER_N, 1, 1)
+matmul_kernel_v7(int M, int N, int K, bf16* C, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB) {
     constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N = BN;
     constexpr int num_consumers = (NUM_THREADS / 128) - 1;
     constexpr int B_WG_M = BM / num_consumers;
+    constexpr int CLUSTERS = CLUSTER_M * CLUSTER_N;
 
     extern __shared__ __align__(128) uint8_t smem[];
     SharedStorage<BM, BN, BK, PIPE> &s = *reinterpret_cast<SharedStorage<BM, BN, BK, PIPE>*>(smem);
     bf16 *sA = s.A;
     bf16 *sB = s.B;
 
-    #pragma nv_diag_suppress static_var_with_dynamic_init
     __shared__ __align__(8) uint64_t full_barrier[PIPE], empty_barrier[PIPE];
+    uint32_t cluster_id, rank;
+    asm volatile("mov.u32 %0, %clusterid.x;\n" : "r"(cluster_id) :);
 
     const int num_tiles_k = K / BK;
-    const int num_blocks_m = M / BM;
-    const int num_blocks_n = N / BN;
+    const int num_blocks_m = M / (BM * CLUSTER_M);
+    const int num_blocks_n = N / (BN * CLUSTER_N);
     const int num_blocks = num_blocks_m * num_blocks_n;
+    constexpr int group_size_m = 16/CLUSTER_M;
+    constexpr int group_size_n = 8/CLUSTER_N;
+    constexpr int tiles_in_group = group_size_m * group_size_n;
+
     int wg_idx = threadIdx.x / 128;
     const int tid = threadIdx.x % 128;
-
-    constexpr int group_size_m = 16;
-    constexpr int group_size_n = 8;
-    constexpr int tiles_in_group = group_size_m * group_size_n;
 
     if (threadIdx.x == 0) {
         for (int i = 0; i < PIPE; ++i) {
             init_barriers(&full_barrier[i], 1);
-            init_barriers(&empty_barrier[i], num_consumers);
+            init_barriers(&empty_barrier[i], num_consumers * CLUSTERS);
         }
     }
-    __syncthreads();
+    asm volatile("barrier.cluster.arrive;\n" : :);
+    asm volatile("barrier.cluster.wait;\n" : :);
+
+    asm volatile("mov.u32 %0, %cluster_ctarank;\n" : "=r"(rank) :);
+    uint32_t rank_m = rank / CLUSTER_N;
+    uint32_t rank_n = rank % CLUSTER_N;
 
     if (wg_idx == 0) {
         constexpr int num_regs = (num_consumers <= 2 ? 24 : 32);
@@ -98,16 +103,39 @@ matmul_kernel_v6(int M, int N, int K, bf16* C, const __grid_constant__ CUtensorM
         if (tid == 0) {
             int pipe_lane = 0;
             int p = 0;
+            uint32_t col_mask = 0;
+            for (int i = 0; i < CLUSTER_M; ++i) {
+                col_mask |= (1 << (i * CLUSTER_N));
+            }
             int tile_m, tile_n;
 
-            for (int tile_idx = blockIdx.x; tile_idx < num_blocks; tile_idx+=NUM_SM) {
+            for (int tile_idx = cluster_id; tile_idx < num_blocks; tile_idx+=NUM_SM/CLUSTERS) {
                 calculate_tile_indices(tile_idx, num_blocks_n, group_size_m, group_size_n, tiles_in_group, tile_m, tile_n);
+                tile_m = tile_m * CLUSTER_M + rank_m;
+                tile_n = tile_n * CLUSTER_N + rank_n;
+
                 for (int k_tile = 0; k_tile < num_tiles_k; ++k_tile, ++pipe_lane) {
                     if (pipe_lane == PIPE) {pipe_lane = 0; p ^= 1; }
                     wait(&empty_barrier[pipe_lane], p);
+
                     expect_bytes(&full_barrier[pipe_lane], (BK*BN+BK*BM)*sizeof(bf16));
-                    load_async(&sA[pipe_lane*BM*BK], &tensorMapA, &full_barrier[pipe_lane], k_tile*BK, tile_m*BM);
-                    load_async(&sB[pipe_lane*BN*BK], &tensorMapB, &full_barrier[pipe_lane], k_tile*BK, tile_n*BN);
+                    if constexpr (CLUSTER_N > 1) {
+                        uint32_t mask = ((1 << CLUSTER_N) - 1) << (rank_m * CLUSTER_N);
+                        if (rank_n == 0) {
+                            load_async_multi(&sA[pipe_lane*BM*BK], &tensorMapA, &full_barrier[pipe_lane], k_tile*BK, tile_m*BM, mask);
+                        }
+                    } else {
+                        load_async_3d(&sA[pipe_lane*BM*BK], &tensorMapA, &full_barrier[pipe_lane], k_tile*BK, tile_m*BM);
+                    }
+
+                    if constexpr (CLUSTER_M > 1) {
+                        if (rank_m == 0) {
+                            load_async_multi(&sB[pipe_lane*BM*BK], &tensorMapB, &full_barrier[pipe_lane], k_tile*BK, tile_n*BN, col_mask);
+                        }
+                    } else {
+                        load_async_3d(&sB[pipe_lane*BN*BK], &tensorMapB, &full_barrier[pipe_lane], k_tile*BK, tile_n*BN);
+                    }
+                    
                 }
             }
         }
@@ -127,6 +155,8 @@ matmul_kernel_v6(int M, int N, int K, bf16* C, const __grid_constant__ CUtensorM
         int tile_m, tile_n;
         for (int tile_idx = blockIdx.x; tile_idx < num_blocks; tile_idx+=NUM_SM) {
             calculate_tile_indices(tile_idx, num_blocks_n, group_size_m, group_size_n, tiles_in_group, tile_m, tile_n);
+            tile_m = tile_m * CLUSTER_M + rank_m;
+            tile_n = tile_n * CLUSTER_N + rank_n;
             memset(d, 0, sizeof(d));
             for (int k_tile = 0; k_tile < num_tiles_k; ++k_tile, ++pipe_lane) {
                 if (pipe_lane == PIPE) {pipe_lane = 0; p ^= 1; }
@@ -143,7 +173,7 @@ matmul_kernel_v6(int M, int N, int K, bf16* C, const __grid_constant__ CUtensorM
                 }
                 warpgroup_commit_batch();
                 warpgroup_wait<0>();
-                if (tid == 0) arrive(&empty_barrier[pipe_lane], 1);
+                if (tid < CLUSTERS) arrive_cluster(&empty_barrier[pipe_lane], tid);
             }
         
 
@@ -174,17 +204,20 @@ matmul_kernel_v6(int M, int N, int K, bf16* C, const __grid_constant__ CUtensorM
     }
 }
 
-void matmul_v6(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
-    constexpr int BM = 128;
+void matmul_v7(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
+    constexpr int BM = 64*2;
     constexpr int BN = 256;
     constexpr int BK = 64;
-    constexpr int NUM_THREADS = 128 * 3;
+    constexpr int NUM_THREADS = 128*3;
     constexpr int PIPE = 3;
+    constexpr int CLUSTER_M = 2;
+    constexpr int CLUSTER_N = 1;
+
     constexpr int NUM_SM = 128;
     d_tma_map_A = create_tensor_map<BM, BK>(A, M, K);
     d_tma_map_B = create_tensor_map<BN, BK>(B, N, K);
 
-    auto* kernel = matmul_kernel_v6<BM,BN,BK,NUM_THREADS,PIPE,NUM_SM>;
+    auto* kernel = matmul_kernel_v7<BM,BN,BK,NUM_THREADS,PIPE,NUM_SM,CLUSTER_M,CLUSTER_N>;
     size_t smem_size = sizeof(SharedStorage<BM, BN, BK, PIPE>);
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     kernel<<<NUM_SM, NUM_THREADS, smem_size>>>(M, N, K, C, d_tma_map_A, d_tma_map_B);
@@ -192,4 +225,4 @@ void matmul_v6(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
 
 }
 
-using M6::matmul_v6;
+using M7::matmul_v7;
