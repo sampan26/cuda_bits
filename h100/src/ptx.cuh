@@ -95,7 +95,7 @@ __device__ static inline void load_async_3d(bf16 *dst, void const* const src_tma
 
   asm volatile (
       "cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
-      " [%0], [%1, {%3, %4, %5, 0, 0}], [%2];"
+      " [%0], [%1, {%3, %4, %5}], [%2];"
       :
       : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr),
       "n"(0), "r"(global_row_idx), "r"(global_col_idx/64)
@@ -111,7 +111,7 @@ __device__ static inline void load_async_multi(bf16 *dst, void const* const src_
 
   asm volatile (
       "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster"
-      " [%0], [%1, {%3, %4, %5, 0, 0}], [%2], %6;"
+      " [%0], [%1, {%3, %4, %5}], [%2], %6;"
       :
       : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr),
       "n"(0), "r"(global_row_idx), "r"(global_col_idx/64), "h"(mask)
