@@ -141,84 +141,41 @@ matmul_kernel_v8(int M, int N, int K, bf16* C, const __grid_constant__ CUtensorM
         }
       }
       else {
-        constexpr int num_regs = (num_consumers == 1 ? 256 : (num_consumers == 2 ? 240 : 160));
+        constexpr int num_regs = (num_consumers == 1) ? 256 : (num_consumers == 2 ? 240 : 160);
         warpgroup_reg_alloc<num_regs>();
-        float d[B_WG_M/WGMMA_M][WGMMA_N/16][8];
-        
-        --wg_idx;
+        float d[B_WG_M / WGMMA_M][BN/16][8];
 
+        --wg_idx;
         for (int i = 0; i < PIPE; ++i) {
-            if (tid < CLUSTERS) arrive_cluster(&empty_barrier[i], tid);
+            arrive_cluster(&empty_barrier[i], tid);
         }
+
         int pipe_lane = 0;
         int p = 0;
         int tile_m, tile_n;
-        for (int tile_idx = cluster_id; tile_idx < num_blocks; tile_idx+=NUM_SM/CLUSTERS) {
+        for (int tile_idx=blockIdx.x; tile_idx<num_blocks; ++tile_idx) {
             calculate_tile_indices(tile_idx, num_blocks_n, group_size_m, group_size_n, tiles_in_group, tile_m, tile_n);
             tile_m = tile_m * CLUSTER_M + rank_m;
             tile_n = tile_n * CLUSTER_N + rank_n;
             {
-                if (pipe_lane == PIPE) {pipe_lane = 0; p ^= 1; }
-                wait(&full_barrier[pipe_lane], p);
-                warpgroup_arrive();
-                #pragma unroll
-                for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
-                    bf16 *wgmma_sA = sA + pipe_lane*BM*BK + BK*WGMMA_M*(m_it + wg_idx*(B_WG_M/WGMMA_M));
-                    bf16 *wgmma_sB = sB + pipe_lane*BK*BN;
-                    {
-                        wgmma<WGMMA_N, 0, 1, 1, 0, 0>(d[m_it], &wgmma_sA[0], &wgmma_sB[0]);
-                        #pragma unroll
-                        for (int k_it = 1; k_it < BK / WGMMA_K; ++k_it) {
-                            wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it*WGMMA_K], &wgmma_sB[k_it*WGMMA_K]);
-                        }
-                    }   
-                }
-                warpgroup_commit_batch();
-                warpgroup_wait<0>();
-                if (tid < CLUSTERS) arrive_cluster(&empty_barrier[pipe_lane], tid);
-            }
-            for (int k_tile = 1; k_tile < num_tiles_k; ++k_tile, ++pipe_lane) {
-                if (pipe_lane == PIPE) {pipe_lane = 0; p ^= 1; }
-                wait(&full_barrier[pipe_lane], p);
-                warpgroup_arrive();
-                #pragma unroll
-                for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
-                    bf16 *wgmma_sA = sA + pipe_lane*BM*BK + BK*WGMMA_M*(m_it + wg_idx*(B_WG_M/WGMMA_M));
-                    bf16 *wgmma_sB = sB + pipe_lane*BK*BN;
-                    #pragma unroll
-                    for (int k_it = 0; k_it < BK / WGMMA_K; ++k_it) {
-                        wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it*WGMMA_K], &wgmma_sB[k_it*WGMMA_K]);
-                    }
-                }
-                warpgroup_commit_batch();
-                warpgroup_wait<0>();
-                if (tid < CLUSTERS) arrive_cluster(&empty_barrier[pipe_lane], tid);
-            }
-        
-
-            int lane = tid % 32;
-            int warp = tid / 32;
-            int row = warp*16 + lane / 4;
-            bf16 *block_C = C + tile_n*BN*M + tile_m*BM;
-
-            #pragma unroll
-            for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
-                int yo = m_it*WGMMA_M + wg_idx*B_WG_M;
-                #pragma unroll
-                for (int w = 0; w < WGMMA_N/16; ++w) {
-                    int col = 16*w + 2*(tid % 4);
-                    #define IDX(i, j) ((j)*M + ((i) + yo))
-                    __stwt(&block_C[IDX(row,         col    )], d[m_it][w][0]);
-                    __stwt(&block_C[IDX(row,         col + 1)], d[m_it][w][1]);
-                    __stwt(&block_C[IDX(row + 8,     col    )], d[m_it][w][2]);
-                    __stwt(&block_C[IDX(row + 8,     col + 1)], d[m_it][w][3]);
-                    __stwt(&block_C[IDX(row,         col + 8)], d[m_it][w][4]);
-                    __stwt(&block_C[IDX(row,         col + 9)], d[m_it][w][5]);
-                    __stwt(&block_C[IDX(row + 8,     col + 8)], d[m_it][w][6]);
-                    __stwt(&block_C[IDX(row + 8,     col + 9)], d[m_it][w][7]);
-
-                    #undef IDX
-                }
+                // if (pipe_lane == PIPE) { pipe_lane = 0; p ^= 1; }
+                // wait(&full_barrier[pipe_lane], p);
+                // warpgroup_arrive();
+                // #pragma unroll
+                // for (int m_it; m_it < B_WG_M/WGMMA_M; m_it++) {
+                //     bf16 *wgmma_sA = sA + pipe_lane*BM*BK + BK*(m_it + wg_idx*B_WG_M/WGMMA_M)*WGMMA_M;
+                //     bf16 *wgmma_sB = sB + pipe_lane*BN*BK;
+                //     {
+                //         wgmma<WGMMA_N, 0, 1, 1, 0, 0>(d[m_it], &wgmma_sA[0], &wgmma_sB[0]);
+                //         #pragma unroll
+                //         for (int k_it=1; k_it < BK/WGMMA_K; ++k_it) {
+                //             wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it*WGMMA_K], &wgmma_sB[k_it*WGMMA_K]);
+                //         }
+                //         wgmma_sA+=64*BM;
+                //         wgmma_sB+=64*BN;
+                //     }
+                // }
+                
             }
         }
     }
