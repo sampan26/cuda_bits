@@ -164,7 +164,7 @@ matmul_kernel_v8(
         int pipe_lane = 0;
         int p = 0;
         int tile_m, tile_n;
-        for (int tile_idx=blockIdx.x; tile_idx<num_blocks; tile_idx+=NUM_SM/CLUSTERS) {
+        for (int tile_idx=cluster_id; tile_idx<num_blocks; tile_idx+=NUM_SM/CLUSTERS) {
             calculate_tile_indices(tile_idx, num_blocks_n, group_size_m, group_size_n, tiles_in_group, tile_m, tile_n);
             tile_m = tile_m * CLUSTER_M + rank_m;
             tile_n = tile_n * CLUSTER_N + rank_n;
@@ -186,62 +186,64 @@ matmul_kernel_v8(
                         wgmma_sB+=64*BN;
                     }
                 }
+            
+                warpgroup_commit_batch();
+                warpgroup_wait<0>();
+                if (tid < CLUSTERS) { arrive_cluster(&empty_barrier[pipe_lane], tid); }
+                ++pipe_lane;
             }
-            warpgroup_commit_batch();
-            warpgroup_wait<0>();
-            if (tid < CLUSTERS) { arrive_cluster(&empty_barrier[pipe_lane], tid); }
-            ++pipe_lane;
-        }
+        
 
-        for (int k_tile = 1; k_tile < num_tiles_k; ++k_tile) {
-            if (pipe_lane == PIPE) { pipe_lane = 0; p ^= 1; }
-            wait(&full_barrier[pipe_lane], p);
-            warpgroup_arrive();
+            for (int k_tile = 1; k_tile < num_tiles_k; ++k_tile) {
+                if (pipe_lane == PIPE) { pipe_lane = 0; p ^= 1; }
+                wait(&full_barrier[pipe_lane], p);
+                warpgroup_arrive();
+                #pragma unroll
+                for (int m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
+                    bf16 *wgmma_sA = sA + pipe_lane*BM*BK + WGMMA_M*BK*(m_it + wg_idx*B_WG_M/WGMMA_M);
+                    bf16 *wgmma_sB = sB + pipe_lane*BN*BK;
+                    #pragma unroll
+                    for (int k_it = 0; k_it < BK/WGMMA_K; ++k_it) {
+                        wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it*WGMMA_K], &wgmma_sB[k_it*WGMMA_K]);
+                    }
+                }
+                warpgroup_commit_batch();
+                warpgroup_wait<0>();
+                if (tid < CLUSTERS) arrive_cluster(&empty_barrier[pipe_lane], tid);
+                ++pipe_lane;
+            }
+            asm volatile("cp.async.bulk.wait_group 0;");
+
+            int row = warp_idx*16 + lane/4;
+            bf16* block_sC = sC + wg_idx*B_WG_M*BN;
             #pragma unroll
             for (int m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
-                bf16 *wgmma_sA = sA + pipe_lane*BM*BK + WGMMA_M*BK*(m_it + wg_idx*B_WG_M/WGMMA_M);
-                bf16 *wgmma_sB = sB + pipe_lane*BN*BK;
+                int yo = m_it * WGMMA_M;
                 #pragma unroll
-                for (int k_it = 0; k_it < BK/WGMMA_K; ++k_it) {
-                    wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it*WGMMA_K], &wgmma_sA[k_it*WGMMA_K]);
+                for (int w = 0; w < WGMMA_N; w+=16) {
+                    int col = w + 2*(tid % 4);
+                    #define ST(i, j, v) block_sC[j * B_WG_M + i + yo] = v
+                    ST(row, col, d[m_it][w/16][0]);
+                    ST(row+8, col, d[m_it][w/16][2]);
+
+                    ST(row, col+1, d[m_it][w/16][1]);
+                    ST(row+8, col+1, d[m_it][w/16][3]);
+
+                    ST(row, col+8, d[m_it][w/16][4]);
+                    ST(row+8, col+8, d[m_it][w/16][6]);
+
+                    ST(row, col+9, d[m_it][w/16][5]);
+                    ST(row+8, col+9, d[m_it][w/16][7]);
+
+                    #undef ST
                 }
             }
-            warpgroup_commit_batch();
-            warpgroup_wait<0>();
-            if (tid < CLUSTERS) arrive_cluster(&empty_barrier[pipe_lane], tid);
-            ++pipe_lane;
-        }
-        asm volatile("cp.async.bulk.wait_group 0;");
 
-        int row = warp_idx*16 + lane/4;
-        bf16* block_sC = sC + wg_idx*B_WG_M*BN;
-        #pragma unroll
-        for (int m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
-            int yo = m_it * WGMMA_M;
-            #pragma unroll
-            for (int w = 0; w < WGMMA_N; w+=16) {
-                int col = w + 2*(tid % 4);
-                #define ST(i, j, v) block_sC[j * B_WG_M + i + yo] = v
-                ST(row, col, d[m_it][w/16][0]);
-                ST(row+8, col, d[m_it][w/16][2]);
-
-                ST(row, col+1, d[m_it][w/16][1]);
-                ST(row+8, col+1, d[m_it][w/16][3]);
-
-                ST(row, col+8, d[m_it][w/16][4]);
-                ST(row+8, col+8, d[m_it][w/16][6]);
-
-                ST(row, col+9, d[m_it][w/16][5]);
-                ST(row+8, col+9, d[m_it][w/16][7]);
-
-                #undef ST
+            asm volatile("bar.sync 10, 256;\n");
+            if (threadIdx.x == 128) {
+                store_async(&tensorMapC, (bf16*)&sC[0], tile_m*BM, tile_n*BN);
+                asm volatile("cp.async.bulk.commit_group;");
             }
-        }
-
-        asm volatile("bar.sync 10, 256;\n");
-        if (threadIdx.x == 128) {
-            store_async(&tensorMapC, (bf16*)&sC[0], tile_m*BM, tile_n*BN);
-            asm volatile("cp.async.bulk.commit_group;");
         }
     }
 }
@@ -258,7 +260,7 @@ void matmul_v8(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     constexpr int NUM_SM = 128;
     d_tma_map_A = create_tensor_map<BM, BK>(A, M, K);
     d_tma_map_B = create_tensor_map<BN, BK>(B, N, K);
-    d_tma_map_C = create_tensor_map<BM, BN, false>(C, M, N);
+    d_tma_map_C = create_tensor_map<BN, BM, false>(C, M, N);
 
     auto* kernel = matmul_kernel_v8<BM,BN,BK,NUM_THREADS,PIPE,NUM_SM,CLUSTER_M,CLUSTER_N>;
     size_t smem_size = sizeof(SharedStorage<BM, BN, BK, PIPE>);
