@@ -94,7 +94,7 @@ __device__ static inline void load_async_3d(bf16 *dst, void const* const src_tma
   uint32_t dst_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
 
   asm volatile (
-      "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
+      "cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
       " [%0], [%1, {%3, %4, %5}], [%2];"
       :
       : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr),
@@ -115,6 +115,42 @@ __device__ static inline void load_async_multi(bf16 *dst, void const* const src_
       :
       : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr),
       "n"(0), "r"(global_row_idx), "r"(global_col_idx/64), "h"(mask)
+      : "memory"
+  );
+}
+
+__device__ static inline void load_async_3d_L2(bf16 *dst, void const* const src_tma_map, uint64_t* bar, int global_col_idx, int global_row_idx) {
+  uint64_t tma_ptr  = reinterpret_cast<uint64_t>(src_tma_map);
+  uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  uint32_t dst_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+  uint64_t cache_hint = static_cast<uint64_t>(0x1000000000000000);
+
+  asm volatile (
+      "cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint"
+      " [%0], [%1, {%3, %4, %5}], [%2], %6;"
+      :
+      : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr),
+      "n"(0), "r"(global_row_idx), "r"(global_col_idx/64), "l"(cache_hint)
+      : "memory"
+  );
+}
+
+
+__device__ static inline void load_async_multi_L2(bf16 *dst, void const* const src_tma_map, uint64_t* bar, int global_col_idx, int global_row_idx, uint16_t mask) {
+  uint64_t tma_ptr  = reinterpret_cast<uint64_t>(src_tma_map);
+  uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  uint32_t dst_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+  uint64_t cache_hint = static_cast<uint64_t>(0x1000000000000000);
+
+
+  asm volatile (
+      "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint"
+      " [%0], [%1, {%3, %4, %5}], [%2], %6, %7;"
+      :
+      : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr),
+      "n"(0), "r"(global_row_idx), "r"(global_col_idx/64), 
+      "h"(mask), 
+      "l"(cache_hint)
       : "memory"
   );
 }

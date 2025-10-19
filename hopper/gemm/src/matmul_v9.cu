@@ -1,6 +1,6 @@
 #include "ptx.cuh"
 
-namespace M8 {
+namespace M9 {
 
 typedef __nv_bfloat16 bf16;
 
@@ -59,7 +59,7 @@ __device__ void calculate_tile_indices(int tile_idx, int num_blocks_n, int group
 template<int BM, int BN, int BK, int NUM_THREADS, int PIPE, int NUM_SM, int CLUSTER_M, int CLUSTER_N>
 __global__  __launch_bounds__(NUM_THREADS) 
 void __cluster_dims__(CLUSTER_M * CLUSTER_N, 1, 1)
-matmul_kernel_v8(
+matmul_kernel_v9(
     int M, int N, int K, bf16* C, 
     const __grid_constant__ CUtensorMap tensorMapA,
     const __grid_constant__ CUtensorMap tensorMapB,
@@ -71,9 +71,9 @@ matmul_kernel_v8(
     constexpr int CLUSTERS = CLUSTER_M * CLUSTER_N;
 
     if (threadIdx.x == 0) {
-        prefetch_tma(tensorMapA);
-        prefetch_tma(tensorMapB);
-        prefetch_tma(tensorMapC);
+        prefetch_tma(&tensorMapA);
+        prefetch_tma(&tensorMapB);
+        prefetch_tma(&tensorMapC);
     }
 
     extern __shared__ __align__(128) uint8_t smem[];
@@ -136,18 +136,18 @@ matmul_kernel_v8(
                     if constexpr (CLUSTER_N > 1) {
                         uint32_t mask = ((1 << CLUSTER_N) - 1) << (rank_m * CLUSTER_N);
                         if (rank_n == 0) {
-                            load_async_multi(&sA[pipe_lane*BM*BK], &tensorMapA, &full_barrier[pipe_lane], k_tile*BK, tile_m*BM, mask);
+                            load_async_multi_L2(&sA[pipe_lane*BM*BK], &tensorMapA, &full_barrier[pipe_lane], k_tile*BK, tile_m*BM, mask);
                         }
                     } else {
-                        load_async_3d(&sA[pipe_lane*BM*BK], &tensorMapA, &full_barrier[pipe_lane], k_tile*BK, tile_m*BM);
+                        load_async_3d_L2(&sA[pipe_lane*BM*BK], &tensorMapA, &full_barrier[pipe_lane], k_tile*BK, tile_m*BM);
                     }
 
                     if constexpr (CLUSTER_M > 1) {
                         if (rank_m == 0) {
-                            load_async_multi(&sB[pipe_lane*BN*BK], &tensorMapB, &full_barrier[pipe_lane], k_tile*BK, tile_n*BN, col_mask << rank_n);
+                            load_async_multi_L2(&sB[pipe_lane*BN*BK], &tensorMapB, &full_barrier[pipe_lane], k_tile*BK, tile_n*BN, col_mask << rank_n);
                         }
                     } else {
-                        load_async_3d(&sB[pipe_lane*BN*BK], &tensorMapB, &full_barrier[pipe_lane], k_tile*BK, tile_n*BN);
+                        load_async_3d_L2(&sB[pipe_lane*BN*BK], &tensorMapB, &full_barrier[pipe_lane], k_tile*BK, tile_n*BN);
                     }
                     
                 }
@@ -254,7 +254,7 @@ matmul_kernel_v8(
     }
 }
 
-void matmul_v8(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
+void matmul_v9(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     constexpr int BM = 64*2;
     constexpr int BN = 256;
     constexpr int BK = 64;
@@ -268,7 +268,7 @@ void matmul_v8(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     d_tma_map_B = create_tensor_map<BN, BK>(B, N, K);
     d_tma_map_C = create_tensor_map<BN, BM, false>(C, N, M);
 
-    auto* kernel = matmul_kernel_v8<BM,BN,BK,NUM_THREADS,PIPE,NUM_SM,CLUSTER_M,CLUSTER_N>;
+    auto* kernel = matmul_kernel_v9<BM,BN,BK,NUM_THREADS,PIPE,NUM_SM,CLUSTER_M,CLUSTER_N>;
     size_t smem_size = sizeof(SharedStorage<BM, BN, BK, PIPE>);
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     kernel<<<NUM_SM, NUM_THREADS, smem_size>>>(M, N, K, C, d_tma_map_A, d_tma_map_B, d_tma_map_C);
@@ -276,4 +276,4 @@ void matmul_v8(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
 
 }
 
-using M8::matmul_v8;
+using M9::matmul_v9;
