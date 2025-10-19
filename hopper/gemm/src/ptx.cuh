@@ -94,7 +94,7 @@ __device__ static inline void load_async_3d(bf16 *dst, void const* const src_tma
   uint32_t dst_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
 
   asm volatile (
-      "cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+      "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
       " [%0], [%1, {%3, %4, %5}], [%2];"
       :
       : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr),

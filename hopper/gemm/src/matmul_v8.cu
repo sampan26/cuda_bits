@@ -89,10 +89,7 @@ matmul_kernel_v8(
     constexpr int tiles_in_group = group_size_m * group_size_n;
 
     int wg_idx = threadIdx.x / 128;
-    const int warp_idx = threadIdx.x / 32;
     const int tid = threadIdx.x % 128;
-    const int lane = tid % 32;
-    
 
     if (threadIdx.x == 0) {
         for (int i = 0; i < PIPE; ++i) {
@@ -168,13 +165,14 @@ matmul_kernel_v8(
             calculate_tile_indices(tile_idx, num_blocks_n, group_size_m, group_size_n, tiles_in_group, tile_m, tile_n);
             tile_m = tile_m * CLUSTER_M + rank_m;
             tile_n = tile_n * CLUSTER_N + rank_n;
+            memset(d, 0, sizeof(d));
             {
                 if (pipe_lane == PIPE) { pipe_lane = 0; p ^= 1; }
                 wait(&full_barrier[pipe_lane], p);
                 warpgroup_arrive();
                 #pragma unroll
                 for (int m_it = 0; m_it < B_WG_M/WGMMA_M; m_it++) {
-                    bf16 *wgmma_sA = sA + pipe_lane*BM*BK + BK*(m_it + wg_idx*B_WG_M/WGMMA_M)*WGMMA_M;
+                    bf16 *wgmma_sA = sA + pipe_lane*BM*BK + BK*(m_it + wg_idx*(B_WG_M/WGMMA_M))*WGMMA_M;
                     bf16 *wgmma_sB = sB + pipe_lane*BN*BK;
                     {
                         wgmma<WGMMA_N, 0, 1, 1, 0, 0>(d[m_it], &wgmma_sA[0], &wgmma_sB[0]);
@@ -214,7 +212,9 @@ matmul_kernel_v8(
             }
             asm volatile("cp.async.bulk.wait_group 0;");
 
-            int row = warp_idx*16 + lane/4;
+            int lane = tid % 32;
+            int warp = tid / 32;
+            int row = warp*16 + lane / 4;
             bf16* block_sC = sC + wg_idx*B_WG_M*BN;
             #pragma unroll
             for (int m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
@@ -222,7 +222,7 @@ matmul_kernel_v8(
                 #pragma unroll
                 for (int w = 0; w < WGMMA_N; w+=16) {
                     int col = w + 2*(tid % 4);
-                    #define ST(i, j, v) block_sC[j * B_WG_M + i + yo] = v
+                    #define ST(i, j, v) block_sC[(j)* B_WG_M + i + yo] = v
                     ST(row, col, d[m_it][w/16][0]);
                     ST(row+8, col, d[m_it][w/16][2]);
 
