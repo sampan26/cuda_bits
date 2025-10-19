@@ -260,7 +260,7 @@ void matmul_v8(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     constexpr int NUM_SM = 128;
     d_tma_map_A = create_tensor_map<BM, BK>(A, M, K);
     d_tma_map_B = create_tensor_map<BN, BK>(B, N, K);
-    d_tma_map_C = create_tensor_map<BN, BM, false>(C, M, N);
+    d_tma_map_C = create_tensor_map<BN, BM, false>(C, N, M);
 
     auto* kernel = matmul_kernel_v8<BM,BN,BK,NUM_THREADS,PIPE,NUM_SM,CLUSTER_M,CLUSTER_N>;
     size_t smem_size = sizeof(SharedStorage<BM, BN, BK, PIPE>);
