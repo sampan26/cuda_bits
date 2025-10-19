@@ -146,17 +146,25 @@ __device__ static __forceinline__ void arrive(uint64_t* bar, uint32_t count=1) {
 
 
 __device__ void arrive_cluster(uint64_t* bar, uint32_t cta_id, uint32_t count=1) {
-  uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-  asm volatile(
-      "{\n\t"
-      ".reg .b32 remAddr32;\n\t"
-      "mapa.shared::cluster.u32  remAddr32, %0, %1;\n\t"
-      "mbarrier.arrive.shared::cluster.b64  _, [remAddr32], %2;\n\t"
-      "}"
-      :
-      : "r"(smem_addr), "r"(cta_id), "r"(count));
+    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    asm volatile(
+        "{\n\t"
+        ".reg .b32 remAddr32;\n\t"
+        "mapa.shared::cluster.u32  remAddr32, %0, %1;\n\t"
+        "mbarrier.arrive.shared::cluster.b64  _, [remAddr32], %2;\n\t"
+        "}"
+        :
+        : "r"(smem_addr), "r"(cta_id), "r"(count));
 }
 
+__device__ void prefetch_tma(CUtensorMap const* ptr) {
+    uint64_t desc_addr = reinterpret_cast<uint64_t>(ptr);
+    asm volatile(
+        "prefetch.tensormap [%0];"
+        :
+        : "l"(desc_addr)
+        : "memory");
+}
 // --- warpgroup flow helpers --------------------------------------------------
 
 __device__ inline void warpgroup_arrive() {
