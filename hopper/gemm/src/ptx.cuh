@@ -214,7 +214,15 @@ __device__ inline void warpgroup_wait() {
   asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
 }
 
-
+__device__ inline void warpgroup_fence_memory(float regs[1][16][8]) {
+  for (int i = 0; i < 1; ++i) {
+    for (int j = 0; j < 16; ++j) {
+      for (int k = 0; k < 8; ++k) {
+        asm volatile("" : +f(reg[i][j][k])::"memory");
+      }
+    }
+  }
+}
 
 template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
 __device__ __forceinline__ void wgmma_m64n256k16(float d[16][8], bf16* sA, bf16* sB) {
