@@ -42,7 +42,7 @@ template <int BM, int BN, int BK, int PIPE>
 struct SharedStorage {
     alignas(128) bf16 A[BM*BK*PIPE];
     alignas(128) bf16 B[BK*BN*PIPE];
-    alignas(128) bf16 C[BM*(BN+(BM/64)*8)];
+    alignas(128) bf16 C[BN*(BM + (BM/64)*8)];
 };
 
 __device__ void calculate_tile_indices(int tile_idx, int num_blocks_n, int group_size_m, int group_size_n, int tiles_in_group, int& tile_m, int& tile_n) {
