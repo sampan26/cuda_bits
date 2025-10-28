@@ -4,7 +4,7 @@ namespace M10 {
 
 typedef __nv_bfloat16 bf16;
 
-template <int BlockMajorSize, int BlockMinorSize, bool swizzle=true>
+template <int BlockMajorSize, int BlockMinorSize, bool swizzle=true, bool padding=false>
 __host__ static inline CUtensorMap create_tensor_map(bf16* gmem_ptr, int global_height, int global_width) {
     CUtensorMap tma_map;
     void* gmem_address = (void*)gmem_ptr;
@@ -12,7 +12,7 @@ __host__ static inline CUtensorMap create_tensor_map(bf16* gmem_ptr, int global_
     assert(global_width % 64 == 0);
     uint64_t gmem_prob_shape[5] = {64, (uint64_t)global_height, (uint64_t)global_width/64, 1, 1};
     uint64_t gmem_prob_stride[5] = {sizeof(bf16) * global_width, 64*sizeof(bf16), 0, 0, 0};
-    uint32_t smem_box_shape[5] = {64, uint32_t(BlockMajorSize), uint32_t(BlockMinorSize/64), 1, 1};
+    uint32_t smem_box_shape[5] = {padding ? 72 : 64, uint32_t(BlockMajorSize), uint32_t(BlockMinorSize/64), 1, 1};
     uint32_t smem_box_stride[5] = {1, 1, 1, 1, 1};
 
     CUresult result = cuTensorMapEncodeTiled(
@@ -42,7 +42,7 @@ template <int BM, int BN, int BK, int PIPE>
 struct SharedStorage {
     alignas(128) bf16 A[BM*BK*PIPE];
     alignas(128) bf16 B[BK*BN*PIPE];
-    alignas(128) bf16 C[BM*BN];
+    alignas(128) bf16 C[BM*(BN+(BM/64)*8)];
 };
 
 __device__ void calculate_tile_indices(int tile_idx, int num_blocks_n, int group_size_m, int group_size_n, int tiles_in_group, int& tile_m, int& tile_n) {
@@ -67,6 +67,7 @@ matmul_kernel_v10(
 {
     constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N = BN;
     constexpr int B_WG_M = BM / NUM_CONSUMERS;
+    constexpr int B_WG_M_PADDED = B_WG_M + 8;
     constexpr int CLUSTERS = CLUSTER_M * CLUSTER_N;
 
     if (threadIdx.x == 0) {
@@ -221,9 +222,9 @@ matmul_kernel_v10(
 
             int lane = tid % 32;
             int warp = tid / 32;
-            bf16* block_sC = sC + wg_idx*B_WG_M*BN;
-            uint32_t tid_offset = warp*16+(lane % 8) * B_WG_M;
-            tid_offset += (lane / 16)*B_WG_M*8 + (lane & 8);
+            bf16* block_sC = sC + wg_idx*B_WG_M_PADDED*BN;
+            uint32_t tid_offset = warp*16+(lane % 8) * B_WG_M_PADDED;
+            tid_offset += (lane / 16)*B_WG_M_PADDED*8 + (lane & 8);
             uint32_t base_addr = static_cast<uint32_t>(__cvta_generic_to_shared(block_sC)) + tid_offset * sizeof(bf16);
 
             bf16 d_bf16[8];
@@ -234,7 +235,7 @@ matmul_kernel_v10(
             for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
                 int yo = m_it * WGMMA_M;
                 for (int w = 0; w < WGMMA_N; w+=16, d_frg += 8) {
-                    uint32_t addr = base_addr + (w * B_WG_M + yo) * sizeof(bf16);
+                    uint32_t addr = base_addr + (w * B_WG_M_PADDED + yo) * sizeof(bf16);
                     
                     for (int k = 0; k < 8; k++) {
                         d_bf16[k] = (bf16)(d_frg[k]);
@@ -268,7 +269,7 @@ void matmul_v10(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     constexpr int NUM_SM = 128;
     d_tma_map_A = create_tensor_map<BM, BK>(A, M, K);
     d_tma_map_B = create_tensor_map<BN, BK>(B, N, K);
-    d_tma_map_C = create_tensor_map<BN, BM / NUM_CONSUMERS, false>(C, N, M);
+    d_tma_map_C = create_tensor_map<BN, BM / NUM_CONSUMERS, false, true>(C, N, M);
 
     auto* kernel = matmul_kernel_v10<BM,BN,BK,NUM_THREADS,NUM_CONSUMERS, PIPE,NUM_SM,CLUSTER_M,CLUSTER_N>;
     size_t smem_size = sizeof(SharedStorage<BM, BN, BK, PIPE>);
