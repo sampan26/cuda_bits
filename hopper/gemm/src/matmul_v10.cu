@@ -245,10 +245,10 @@ matmul_kernel_v10(
                 }
             }
 
-            asm volatile("bar.sync 10, 128;\n");
+            asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx + 2) : "memory");
 
             if (tid == 0) {
-                store_async(&tensorMapC, (bf16*)&sC[0], tile_m*BM +  wg_idx*B_WG_M, tile_n*BN);
+                store_async(&tensorMapC, block_sC, tile_m*BM +  wg_idx*B_WG_M, tile_n*BN);
                 asm volatile("cp.async.bulk.commit_group;");
             }
         }
