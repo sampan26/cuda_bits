@@ -231,7 +231,7 @@ matmul_kernel_v10(
             float* d_frg = (float*)d;
 
             #pragma unroll
-            for (int m_it = 0; m_it < B_WG_M / NUM_CONSUMERS; ++m_it) {
+            for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
                 int yo = m_it * WGMMA_M;
                 for (int w = 0; w < WGMMA_N; w+=16, d_frg += 8) {
                     uint32_t addr = base_addr + (w * B_WG_M + yo) * sizeof(bf16);
@@ -247,7 +247,7 @@ matmul_kernel_v10(
 
             asm volatile("bar.sync 10, 128;\n");
 
-            if (threadIdx.x == 128) {
+            if (tid == 0) {
                 store_async(&tensorMapC, (bf16*)&sC[0], tile_m*BM +  wg_idx*B_WG_M, tile_n*BN);
                 asm volatile("cp.async.bulk.commit_group;");
             }
