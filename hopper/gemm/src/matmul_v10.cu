@@ -1,6 +1,6 @@
 #include "ptx.cuh"
 
-namespace M9 {
+namespace M10 {
 
 typedef __nv_bfloat16 bf16;
 
@@ -59,7 +59,7 @@ __device__ void calculate_tile_indices(int tile_idx, int num_blocks_n, int group
 template<int BM, int BN, int BK, int NUM_THREADS, int NUM_CONSUMERS, int PIPE, int NUM_SM, int CLUSTER_M, int CLUSTER_N>
 __global__  __launch_bounds__(NUM_THREADS) 
 void __cluster_dims__(CLUSTER_M * CLUSTER_N, 1, 1)
-matmul_kernel_v9(
+matmul_kernel_v10(
     int M, int N, int K, bf16* C, 
     const __grid_constant__ CUtensorMap tensorMapA,
     const __grid_constant__ CUtensorMap tensorMapB,
@@ -223,20 +223,21 @@ matmul_kernel_v9(
             int warp = tid / 32;
             bf16* block_sC = sC + wg_idx*B_WG_M*BN;
             uint32_t tid_offset = warp*16+(lane % 8) * B_WG_M;
-            tid_offset += (lane / 16)*B_WG_M + (lane & 8);
+            tid_offset += (lane / 16)*B_WG_M*8 + (lane & 8);
             uint32_t base_addr = static_cast<uint32_t>(__cvta_generic_to_shared(block_sC)) + tid_offset * sizeof(bf16);
 
             bf16 d_bf16[8];
             int4* data_ptr = (int4*)d_bf16;
+            float* d_frg = (float*)d;
 
             #pragma unroll
             for (int m_it = 0; m_it < B_WG_M / NUM_CONSUMERS; ++m_it) {
                 int yo = m_it * WGMMA_M;
-                for (int w = 0; w < WGMMA_N; w+=16, d += 8) {
+                for (int w = 0; w < WGMMA_N; w+=16, d_frg += 8) {
                     uint32_t addr = base_addr + (w * B_WG_M + yo) * sizeof(bf16);
                     
                     for (int k = 0; k < 8; k++) {
-                        d_bf16[k] = (bf16)(d[k]);
+                        d_bf16[k] = (bf16)(d_frg[k]);
                     }
                     asm volatile(
                         "stmatrix.sync.aligned.m8n8.trans.x4.shared::cta.b16 [%0], {%1, %2, %3, %4};"
@@ -254,7 +255,7 @@ matmul_kernel_v9(
     }
 }
 
-void matmul_v9(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
+void matmul_v10(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     constexpr int BM = 64*2;
     constexpr int BN = 256;
     constexpr int BK = 64;
@@ -269,7 +270,7 @@ void matmul_v9(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     d_tma_map_B = create_tensor_map<BN, BK>(B, N, K);
     d_tma_map_C = create_tensor_map<BN, BM / NUM_CONSUMERS, false>(C, N, M);
 
-    auto* kernel = matmul_kernel_v9<BM,BN,BK,NUM_THREADS,NUM_CONSUMERS, PIPE,NUM_SM,CLUSTER_M,CLUSTER_N>;
+    auto* kernel = matmul_kernel_v10<BM,BN,BK,NUM_THREADS,NUM_CONSUMERS, PIPE,NUM_SM,CLUSTER_M,CLUSTER_N>;
     size_t smem_size = sizeof(SharedStorage<BM, BN, BK, PIPE>);
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     kernel<<<NUM_SM, NUM_THREADS, smem_size>>>(M, N, K, C, d_tma_map_A, d_tma_map_B, d_tma_map_C);
@@ -277,4 +278,4 @@ void matmul_v9(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
 
 }
 
-using M9::matmul_v9;
+using M10::matmul_v10;
