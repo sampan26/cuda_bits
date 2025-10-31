@@ -10,11 +10,10 @@ constexpr int WARP_THREADS = 32;
 constexpr int WARPGROUP_WARPS = 4;
 constexpr int WARPGROUP_THREADS = WARP_THREADS * WARPGROUP_WARPS;
 
-template <int BlockMajorSize, int BlockMinorSize>
+template <int BlockMajorSize, int BlockMinorSize, int swizzle_bytes>
 __host__ static inline CUtensorMap create_tensor_map(const nv_bfloat16* gmem_ptr, int global_height, int global_width) {
     CUtensorMap tma_map;
     void* gmem_address = (void*)gmem_ptr;
-    constexpr int swizzle_bytes = 32;
     constexpr int swizzle_elements = swizzle_bytes / sizeof(nv_bfloat16);
     constexpr CUtensorMapSwizzle tma_swizzle = 
         swizzle_bytes == 32  ? CU_TENSOR_MAP_SWIZZLE_32B  :
@@ -44,7 +43,7 @@ struct SharedStorage {
   alignas(128) nv_bfloat16 B[BK*BN];
 };
 
-template <int BM, int BN, int BK, int NUM_THREADS>
+template <int BM, int BN, int BK, int NUM_THREADS, int swizzle_elements>
 __global__ void __launch_bounds__(NUM_THREADS) 
 matmul_kernel_v1(int M, int N, int K, nv_bfloat16* C, 
                  const __grid_constant__ CUtensorMap tensorMapA,
@@ -55,6 +54,7 @@ matmul_kernel_v1(int M, int N, int K, nv_bfloat16* C,
     int lane_id = threadIdx.x % WARP_THREADS;
     int warp_id = threadIdx.x / WARP_THREADS;
     int warpgroup_id = threadIdx.x / WARPGROUP_THREADS;
+    int tid = threadIdx.x % 128;
 
     constexpr int BM_MMA_M = BM / (NUM_THREADS / 128);
     const int num_tiles_k = K / BK;
@@ -68,6 +68,8 @@ matmul_kernel_v1(int M, int N, int K, nv_bfloat16* C,
     nv_bfloat16 *sB = s.B;
 
     __shared__ uint64_t input_arrive;
+    __shared__ uint64_t mma_bar;
+    __shared__ uint64_t epi_bar;
     __shared__ uint64_t tmem_addr_shared;
 
     if (threadIdx.x == 0) {
@@ -78,27 +80,59 @@ matmul_kernel_v1(int M, int N, int K, nv_bfloat16* C,
     uint32_t n_cols = 32;
     if (warp_id == 0) {
         tmem_alloc(tmem_addr_shared, n_cols);
+        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
-
     __syncthreads();
     tmem_addr = tmem_addr_shared;
-    uint32_t phase_bit = 0;
+    
+    uint32_t prod_phase_bit = 0;
+    uint32_t mma_phase_bit = 0;
     for (int k_tile = 0; k_tile < num_tiles_k; ++k_tile) {
         if (tid == 0) {
             expect_bytes(&input_arrive, (BK*BN+BK*BM)*sizeof(nv_bfloat16));
-            tma_load(&sA, &tensorMapA, &input_arrive, k_tile*BK, tile_m*BM);
-            tma_load(&sB, &tensorMapB, &input_arrive, k_tile*BK, tile_n*BN);
-        }
+            tma_load<swizzle_elements>(&sA[0], &tensorMapA, &input_arrive, k_tile*BK, tile_m*BM);
+            tma_load<swizzle_elements>(&sB[0], &tensorMapB, &input_arrive, k_tile*BK, tile_n*BN);
 
-        wait(&input_arrive, phase_bit);
-        asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+            wait(&input_arrive, prod_phase_bit);
+            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 
-        for (int m = 0; m < BM_MMA_M / MMA_M; ++m) {
-            nv_bfloat16 *m_mma_tile = sA + MMA_M*(m + warpgroup_id*BM_MMA_M/MMA_M)*BK;
-            for (int k = 0; k < BK / MMA_K; ++k) {
-                tcgen05_mma(&m_mma_tile[k*MMA_K], &sB[k*MMA_K]);
+            for (int m = 0; m < BM_MMA_M / MMA_M; ++m) {
+                nv_bfloat16 *m_mma_tile = sA + MMA_M*(m + warpgroup_id*BM_MMA_M/MMA_M)*BK;
+                for (int k = 0; k < BK / MMA_K; ++k) {
+                    tcgen05_mma(tm_addr, &m_mma_tile[k*MMA_K], &sB[k*MMA_K]);
+                }
             }
+            tcgen05_commit_group(&mma_bar);
+
+            wait(&mma_bar, mma_phase_bit);
+            float tmp[32];
+            asm volatile("tcgen05.ld.sync.aligned.16x256b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                : "=f"(tmp[0]), "=f"(tmp[1]), "=f"(tmp[2]), "=f"(tmp[3]),
+                "=f"(tmp[4]), "=f"(tmp[5]), "=f"(tmp[6]), "=f"(tmp[7]),
+                "=f"(tmp[8]), "=f"(tmp[9]), "=f"(tmp[10]), "=f"(tmp[11]),
+                "=f"(tmp[12]), "=f"(tmp[13]), "=f"(tmp[14]), "=f"(tmp[15]),
+                "=f"(tmp[16]), "=f"(tmp[17]), "=f"(tmp[18]), "=f"(tmp[19]),
+                "=f"(tmp[20]), "=f"(tmp[21]), "=f"(tmp[22]), "=f"(tmp[23]),
+                "=f"(tmp[24]), "=f"(tmp[25]), "=f"(tmp[26]), "=f"(tmp[27]),
+                "=f"(tmp[28]), "=f"(tmp[29]), "=f"(tmp[30]), "=f"(tmp[31])
+                : "r"(tm_addr + (0 << 16) + (0))
+            );
+
+            asm volatile("tcgen05.wait::ld.sync.aligned;");
+            if (threadIdx.x == 0)
+            asm volatile(
+                "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
+                :: "l"(__cvta_generic_to_shared(&epi_bar))
+                : "memory"
+            );
         }
+        
+
+    }
+    if (warp_id == 0) { // must be performed by a single warp in the CTA
+        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
+            :: "r"(tm_addr), "r"(n_cols)
+        );
     }
 
 }
@@ -109,11 +143,14 @@ void matmul_v1(const nv_bfloat16 *A, const nv_bfloat16 *B, nv_bfloat16 *C, int M
     constexpr int BK = 64;
     constexpr int NUM_THREADS = 128;
 
-    d_tma_map_A = create_tensor_map<BM, BK>(A, M, K);
-    d_tma_map_B = create_tensor_map<BN, BK>(B, N, K);
+    constexpr int swizzle_bytes = 32;
+    constexpr int swizzle_elements = swizzle_bytes / sizeof(nv_bfloat16);
+
+    d_tma_map_A = create_tensor_map<BM, BK, swizzle_bytes>(A, M, K);
+    d_tma_map_B = create_tensor_map<BN, BK, swizzle_bytes>(B, N, K);
 
     size_t smem_size = sizeof(SharedStorage<BM, BN, BK>);
-    auto* kernel = matmul_kernel_v1<BM,BN,BK, NUM_THREADS>;
+    auto* kernel = matmul_kernel_v1<BM,BN,BK, NUM_THREADS, swizzle_elements>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     kernel<<<(M/BM) * (N/BN), NUM_THREADS, smem_size>>>(
         M, N, K, C, d_tma_map_A, d_tma_map_B
