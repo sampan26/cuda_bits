@@ -49,14 +49,10 @@ matmul_kernel_v1(int M, int N, int K, nv_bfloat16* C,
                  const __grid_constant__ CUtensorMap tensorMapA,
                  const __grid_constant__ CUtensorMap tensorMapB) 
 {
-    constexpr int MMA_M = 64, MMA_K = 16, MMA_N = BN;
-
     int lane_id = threadIdx.x % WARP_THREADS;
     int warp_id = threadIdx.x / WARP_THREADS;
     int warpgroup_id = threadIdx.x / WARPGROUP_THREADS;
     int tid = threadIdx.x % 128;
-
-    constexpr int BM_MMA_M = BM / (NUM_THREADS / 128);
     const int num_tiles_k = K / BK;
     const int num_rows_n = N / BN;
     const int tile_m = blockIdx.x / num_rows_n;
@@ -69,14 +65,14 @@ matmul_kernel_v1(int M, int N, int K, nv_bfloat16* C,
 
     __shared__ uint64_t input_arrive;
     __shared__ uint64_t mma_bar;
-    __shared__ uint64_t epi_bar;
     __shared__ uint64_t tmem_addr_shared;
 
     if (threadIdx.x == 0) {
         init_barriers(&input_arrive, 1);
+        init_barriers(&mma_bar, 1);
     }
 
-    uint64_t tmem_addr = 0;
+    uint32_t tmem_addr = 0;
     uint32_t n_cols = 32;
     if (warp_id == 0) {
         tmem_alloc(tmem_addr_shared, n_cols);
@@ -89,49 +85,86 @@ matmul_kernel_v1(int M, int N, int K, nv_bfloat16* C,
     uint32_t mma_phase_bit = 0;
     for (int k_tile = 0; k_tile < num_tiles_k; ++k_tile) {
         if (tid == 0) {
+            // load to tma
             expect_bytes(&input_arrive, (BK*BN+BK*BM)*sizeof(nv_bfloat16));
             tma_load<swizzle_elements>(&sA[0], &tensorMapA, &input_arrive, k_tile*BK, tile_m*BM);
             tma_load<swizzle_elements>(&sB[0], &tensorMapB, &input_arrive, k_tile*BK, tile_n*BN);
 
+            constexpr uint32_t idesc = 
+                (0b00 << 0)      | // dense mma
+                (0b0 << 2)       | // no sparsity
+                (0b0 << 3)       | // no saturation
+                (0b01 << 4)      | // F32 Accum
+                (0b0 << 6)       | // Reserved
+                (0b001 << 7)     | // BF16 A dtype
+                (0b001 << 10)    | // BF16 B dtype
+                (0b0 << 13)      | // No Negation
+                (0b0 << 14)      | // No Negation
+                (0b0 << 15)      | // No Transpose A
+                (0b1 << 16)      | // Transpose B
+                ((BN >> 3) << 17) | // N, encoded
+                (0b0 << 23)      | // Reserved
+                ((BM >> 3) << 24) | // M, encoded
+                (0b0 << 29)      | // Reserved
+                (0b0 << 30);       // No B reuse
+
+            uint64_t a_desc = 
+                (((static_cast<uint32_t>(__cvta_generic_to_shared(&sA[0])) & 0x3FFFF) >> 4) << 0) |
+                (0x0L << 16)                     |
+                (((BK * sizeof(nv_bfloat16) & 0x3FFFF) >> 4) << 32)  |
+                (0b001L << 46)                   |
+                (0b000L << 49)                   |
+                (0b0L << 52)                     | 
+                (0b0000'0000L << 53)             | 
+                (0x6L << 61);                        
+                
+            uint64_t b_desc = 
+                (((static_cast<uint32_t>(__cvta_generic_to_shared(&sB[0])) & 0x3FFFF) >> 4) << 0) |
+                (0x0L << 16)                              |
+                ((((BK * BN * sizeof(nv_bfloat16)) & 0x3'FFFF) >> 4) << 32) |
+                (0b001L << 46)                            |
+                (0b000L << 49)                            |
+                (0b0L << 52)                              | 
+                (0b0000'0000L << 53)                      | 
+                (0x6L << 61);
+
+            // wait for input_arrive to complete
             wait(&input_arrive, prod_phase_bit);
+            prod_phase_bit ^= 1;
+            asm volatile("{tcgen05.fence::after_thread_sync;}");
             asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 
-            for (int m = 0; m < BM_MMA_M / MMA_M; ++m) {
-                nv_bfloat16 *m_mma_tile = sA + MMA_M*(m + warpgroup_id*BM_MMA_M/MMA_M)*BK;
-                for (int k = 0; k < BK / MMA_K; ++k) {
-                    tcgen05_mma(tm_addr, &m_mma_tile[k*MMA_K], &sB[k*MMA_K]);
-                }
-            }
-            tcgen05_commit_group(&mma_bar);
+            
+            tcgen05_mma(tmem_addr, idesc, a_desc, b_desc);
+            tcgen05_commit_group(&mma_bar); // tgen05 mma commit
 
             wait(&mma_bar, mma_phase_bit);
-            float tmp[32];
-            asm volatile("tcgen05.ld.sync.aligned.16x256b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                : "=f"(tmp[0]), "=f"(tmp[1]), "=f"(tmp[2]), "=f"(tmp[3]),
-                "=f"(tmp[4]), "=f"(tmp[5]), "=f"(tmp[6]), "=f"(tmp[7]),
-                "=f"(tmp[8]), "=f"(tmp[9]), "=f"(tmp[10]), "=f"(tmp[11]),
-                "=f"(tmp[12]), "=f"(tmp[13]), "=f"(tmp[14]), "=f"(tmp[15]),
-                "=f"(tmp[16]), "=f"(tmp[17]), "=f"(tmp[18]), "=f"(tmp[19]),
-                "=f"(tmp[20]), "=f"(tmp[21]), "=f"(tmp[22]), "=f"(tmp[23]),
-                "=f"(tmp[24]), "=f"(tmp[25]), "=f"(tmp[26]), "=f"(tmp[27]),
-                "=f"(tmp[28]), "=f"(tmp[29]), "=f"(tmp[30]), "=f"(tmp[31])
-                : "r"(tm_addr + (0 << 16) + (0))
-            );
+            mma_phase_bit ^= 1;
+            asm volatile("tcgen05.fence::before_thread_sync;\n");
+            asm volatile("bar.sync 0;\n");
+            asm volatile("tcgen05.fence::after_thread_sync;\n");
+            asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
 
-            asm volatile("tcgen05.wait::ld.sync.aligned;");
-            if (threadIdx.x == 0)
-            asm volatile(
-                "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
-                :: "l"(__cvta_generic_to_shared(&epi_bar))
-                : "memory"
-            );
+    //         float tmp[32];
+    //         asm volatile("tcgen05.ld.sync.aligned.16x256b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+    //             : "=f"(tmp[0]), "=f"(tmp[1]), "=f"(tmp[2]), "=f"(tmp[3]),
+    //             "=f"(tmp[4]), "=f"(tmp[5]), "=f"(tmp[6]), "=f"(tmp[7]),
+    //             "=f"(tmp[8]), "=f"(tmp[9]), "=f"(tmp[10]), "=f"(tmp[11]),
+    //             "=f"(tmp[12]), "=f"(tmp[13]), "=f"(tmp[14]), "=f"(tmp[15]),
+    //             "=f"(tmp[16]), "=f"(tmp[17]), "=f"(tmp[18]), "=f"(tmp[19]),
+    //             "=f"(tmp[20]), "=f"(tmp[21]), "=f"(tmp[22]), "=f"(tmp[23]),
+    //             "=f"(tmp[24]), "=f"(tmp[25]), "=f"(tmp[26]), "=f"(tmp[27]),
+    //             "=f"(tmp[28]), "=f"(tmp[29]), "=f"(tmp[30]), "=f"(tmp[31])
+    //             : "r"(tmem_addr + (0 << 16) + (0))
+    //         );
+
+    //         //wait ld
+    //         asm volatile("tcgen05.wait::ld.sync.aligned;");
         }
-        
-
     }
     if (warp_id == 0) { // must be performed by a single warp in the CTA
         asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
-            :: "r"(tm_addr), "r"(n_cols)
+            :: "r"(tmem_addr), "r"(n_cols)
         );
     }
 
