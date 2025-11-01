@@ -18,8 +18,8 @@ __device__ static __forceinline__ void expect_bytes(uint64_t* bar, uint32_t byte
     );
 }
 
-__device__ static __forceinline__ void wait(uint64_t* bar, int kPhaseBit) {
-    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar)); 
+__device__ static __forceinline__ void wait(uint64_t& bar, int kPhaseBit) {
+    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&bar)); 
     asm volatile (
         "{\n"
         ".reg .pred                P1;\n"
@@ -53,9 +53,10 @@ __device__ static inline void tma_load(nv_bfloat16 *dst, void const* const src_t
 
 
 // tcgen05 helpers
-__device__ static __forceinline__ void tmem_alloc(uint64_t& dst_addr, int n_cols) {
-    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.b32 [%0], %1;\n"
-        :: "l"((uint64_t)&dst_addr), "r"(n_cols)
+__device__ static __forceinline__ void tmem_alloc(uint32_t* dst_addr, int n_cols) {
+    asm volatile(
+        "tcgen05.alloc.cta_group::1.sync.aligned.b32 [%0], %1;\n"
+        :: "l"(dst_addr), "r"(n_cols)
     );
 }
 
@@ -70,8 +71,8 @@ __device__ __forceinline__ void tcgen05_mma(uint32_t tm_addr, uint32_t i_desc, u
 }
 
 __device__ __forceinline__ void tcgen05_commit_group(uint64_t *bar) {
-    uint64_t mbar_ptr = static_cast<uint64_t>(__cvta_generic_to_shared(bar));
+    uint32_t mbar_ptr = static_cast<uint32_t >(__cvta_generic_to_shared(bar));
     asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];"
-        :: "l"(mbar_ptr)
+        :: "r"(mbar_ptr)
     );
 }
