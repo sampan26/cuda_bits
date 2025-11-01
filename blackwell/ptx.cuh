@@ -36,10 +36,9 @@ __device__ static __forceinline__ void wait(uint64_t& bar, int kPhaseBit) {
 
 // tma helpers
 template <int SWIZZLE_ELEMENTS>
-__device__ static inline void tma_load(nv_bfloat16 *dst, void const* const src_tma_map, uint64_t* bar, int global_col_idx, int global_row_idx) {
+__device__ static inline void tma_load(uint32_t dst_ptr, void const* const src_tma_map, uint64_t* bar, int global_col_idx, int global_row_idx) {
     uint64_t tma_ptr  = reinterpret_cast<uint64_t>(src_tma_map);
     uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-    uint32_t dst_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
 
     asm volatile (
         "cp.async.bulk.tensor.5d.shared::cta.global.tile.mbarrier::complete_tx::bytes.cta_group::1 "
@@ -61,12 +60,15 @@ __device__ static __forceinline__ void tmem_alloc(uint32_t* dst_addr, int n_cols
 }
 
 
-__device__ __forceinline__ void tcgen05_mma(uint32_t tm_addr, uint32_t i_desc, uint64_t a_desc, uint64_t b_desc) {
+__device__ __forceinline__ void tcgen05_mma(uint32_t tm_addr, uint32_t i_desc, uint64_t a_desc, uint64_t b_desc, int scale) {
     asm volatile(
-        "{.reg .pred P1;                                              \t\n"
-        "setp.eq.u32 P1, 1, %4;                                       \t\n"
-        "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, P1;  \t\n}"
-        :: "r"(tm_addr), "l"(a_desc), "l"(b_desc), "r"(i_desc), "n"(/*acc=*/0)
+        "{\n"
+        ".reg .pred p;\n"
+        "setp.eq.u32 p, 1, 0;\n"
+        "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, "
+        "{%5, %6, %7, %8}, p;\n"
+        "}\n"
+        :: "r"(tm_addr), "l"(a_desc), "l"(b_desc), "r"(i_desc), "r"(scale), "r"(0), "r"(0), "r"(0), "r"(0)
     );
 }
 
