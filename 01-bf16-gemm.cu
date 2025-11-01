@@ -53,6 +53,8 @@ matmul_kernel_v1(int M, int N, int K, nv_bfloat16* C,
     int warp_id = threadIdx.x / WARP_THREADS;
     int warpgroup_id = threadIdx.x / WARPGROUP_THREADS;
     int tid = threadIdx.x % 128;
+
+    constexpr uint32_t UMMA_M = BM, UMMA_N = BN, UMMA_K = 16;
     const int num_tiles_k = K / BK;
     const int num_rows_n = N / BN;
     const int tile_m = blockIdx.x / num_rows_n;
@@ -63,87 +65,99 @@ matmul_kernel_v1(int M, int N, int K, nv_bfloat16* C,
     nv_bfloat16 *sA = s.A;
     nv_bfloat16 *sB = s.B;
 
-    __shared__ uint64_t input_arrive;
-    __shared__ uint64_t mma_bar;
-    __shared__ uint64_t tmem_addr_shared;
+    __shared__ __align__(8) uint64_t tma_bar;
+    __shared__ __align__(8) uint64_t mma_bar;
+    __shared__ __align__(8) uint32_t tmem_addr_shared;
 
     if (threadIdx.x == 0) {
-        init_barriers(&input_arrive, 1);
+        init_barriers(&tma_bar, 1);
         init_barriers(&mma_bar, 1);
     }
 
     uint32_t tmem_addr = 0;
     uint32_t n_cols = 32;
     if (warp_id == 0) {
-        tmem_alloc(tmem_addr_shared, n_cols);
+        tmem_alloc(&tmem_addr_shared, n_cols);
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
     __syncthreads();
     tmem_addr = tmem_addr_shared;
     
-    uint32_t prod_phase_bit = 0;
+    uint32_t tma_phase_bit = 0;
     uint32_t mma_phase_bit = 0;
+
     for (int k_tile = 0; k_tile < num_tiles_k; ++k_tile) {
         if (tid == 0) {
             // load to tma
-            expect_bytes(&input_arrive, (BK*BN+BK*BM)*sizeof(nv_bfloat16));
-            tma_load<swizzle_elements>(&sA[0], &tensorMapA, &input_arrive, k_tile*BK, tile_m*BM);
-            tma_load<swizzle_elements>(&sB[0], &tensorMapB, &input_arrive, k_tile*BK, tile_n*BN);
+            expect_bytes(&tma_bar, (BK*BN+BK*BM)*sizeof(nv_bfloat16));
+            tma_load<swizzle_elements>(&sA[0], &tensorMapA, &tma_bar, k_tile*BK, tile_m*BM);
+            tma_load<swizzle_elements>(&sB[0], &tensorMapB, &tma_bar, k_tile*BK, tile_n*BN);
+        }
+        constexpr uint32_t idesc = 
+            (0b00 << 0)              | // dense mma
+            (0b0 << 2)               | // no sparsity
+            (0b0 << 3)               | // no saturation
+            (0b01 << 4)              | // F32 Accum
+            (0b0 << 6)               | // Reserved
+            (0b001 << 7)             | // BF16 A dtype
+            (0b001 << 10)            | // BF16 B dtype
+            (0b0 << 13)              | // No Negation
+            (0b0 << 14)              | // No Negation
+            (0b0 << 15)              | // A K-Major
+            (0b1 << 16)              | // B K-Major
+            ((BN >> 3) << 17)        | // N, encoded
+            (0b0 << 23)              | // Reserved
+            ((BM >> 3) << 24)        | // M, encoded
+            (0b0 << 29)              | // Reserved
+            (0b00 << 30);              // No B reuse
 
-            constexpr uint32_t idesc = 
-                (0b00 << 0)      | // dense mma
-                (0b0 << 2)       | // no sparsity
-                (0b0 << 3)       | // no saturation
-                (0b01 << 4)      | // F32 Accum
-                (0b0 << 6)       | // Reserved
-                (0b001 << 7)     | // BF16 A dtype
-                (0b001 << 10)    | // BF16 B dtype
-                (0b0 << 13)      | // No Negation
-                (0b0 << 14)      | // No Negation
-                (0b0 << 15)      | // No Transpose A
-                (0b1 << 16)      | // Transpose B
-                ((BN >> 3) << 17) | // N, encoded
-                (0b0 << 23)      | // Reserved
-                ((BM >> 3) << 24) | // M, encoded
-                (0b0 << 29)      | // Reserved
-                (0b0 << 30);       // No B reuse
-
-            uint64_t a_desc = 
-                (((static_cast<uint32_t>(__cvta_generic_to_shared(&sA[0])) & 0x3FFFF) >> 4) << 0) |
-                (0x0L << 16)                     |
-                (((BK * sizeof(nv_bfloat16) & 0x3FFFF) >> 4) << 32)  |
-                (0b001L << 46)                   |
-                (0b000L << 49)                   |
-                (0b0L << 52)                     | 
-                (0b0000'0000L << 53)             | 
-                (0x6L << 61);                        
-                
-            uint64_t b_desc = 
-                (((static_cast<uint32_t>(__cvta_generic_to_shared(&sB[0])) & 0x3FFFF) >> 4) << 0) |
-                (0x0L << 16)                              |
-                ((((BK * BN * sizeof(nv_bfloat16)) & 0x3'FFFF) >> 4) << 32) |
-                (0b001L << 46)                            |
-                (0b000L << 49)                            |
-                (0b0L << 52)                              | 
-                (0b0000'0000L << 53)                      | 
-                (0x6L << 61);
-
-            // wait for input_arrive to complete
-            wait(&input_arrive, prod_phase_bit);
-            prod_phase_bit ^= 1;
-            asm volatile("{tcgen05.fence::after_thread_sync;}");
-            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-
+        uint64_t a_desc = 
+            (((static_cast<uint32_t>(__cvta_generic_to_shared(&sA[0])) & 0x3FFFF) >> 4) << 0) |
+            (0b00L << 14)                             |
+            (0x0L << 16)                              |
+            (((BK * sizeof(nv_bfloat16) & 0x3FFFF) >> 4) << 32)  |
+            (0b001L << 46)                   |
+            (0b000L << 49)                   |
+            (0b0L << 52)                     | 
+            (0b0000'0000L << 53)             | 
+            (0x6L << 61);                        
             
-            tcgen05_mma(tmem_addr, idesc, a_desc, b_desc);
-            tcgen05_commit_group(&mma_bar); // tgen05 mma commit
+        uint64_t b_desc = 
+            (((static_cast<uint32_t>(__cvta_generic_to_shared(&sB[0])) & 0x3FFFF) >> 4) << 0) |
+            (0x0L << 16)                              |
+            ((((BK * BN * sizeof(nv_bfloat16)) & 0x3'FFFF) >> 4) << 32) |
+            (0b001L << 46)                            |
+            (0b000L << 49)                            |
+            (0b0L << 52)                              | 
+            (0b0000'0000L << 53)                      | 
+            (0x6L << 61);
 
-            wait(&mma_bar, mma_phase_bit);
-            mma_phase_bit ^= 1;
-            asm volatile("tcgen05.fence::before_thread_sync;\n");
-            asm volatile("bar.sync 0;\n");
-            asm volatile("tcgen05.fence::after_thread_sync;\n");
-            asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
+        // wait for tma_bar to complete
+        wait(tma_bar, tma_phase_bit);
+        tma_phase_bit ^= 1;
+        if (tid == 0) {
+            tcgen05_mma(tmem_addr, idesc, a_desc, b_desc);
+        }
+        if (tid == 0) {
+            asm volatile("tcgen05.fence::after_thread_sync;");
+
+            // for (int k = 0; k < BK / UMMA_K; ++k) {
+            //     a_desc += UMMA_K;
+            //     b_desc += UMMA_K;
+            // }
+
+        //     tcgen05_commit_group(&mma_bar);
+        }
+            
+            // 
+            //  // tgen05 mma commit
+
+            // wait(&mma_bar, mma_phase_bit);
+            // mma_phase_bit ^= 1;
+            // asm volatile("tcgen05.fence::before_thread_sync;\n");
+            // asm volatile("bar.sync 0;\n");
+            // asm volatile("tcgen05.fence::after_thread_sync;\n");
+            // asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
 
     //         float tmp[32];
     //         asm volatile("tcgen05.ld.sync.aligned.16x256b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
@@ -160,7 +174,7 @@ matmul_kernel_v1(int M, int N, int K, nv_bfloat16* C,
 
     //         //wait ld
     //         asm volatile("tcgen05.wait::ld.sync.aligned;");
-        }
+        
     }
     if (warp_id == 0) { // must be performed by a single warp in the CTA
         asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
