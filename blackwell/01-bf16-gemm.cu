@@ -191,7 +191,7 @@ matmul_kernel_v1(int M, int N, int K, nv_bfloat16* C,
             :: "r"(tmem_addr), "r"(n_cols)
         );
     }
-
+ 
 }
 
 void matmul_v1(const nv_bfloat16 *A, const nv_bfloat16 *B, nv_bfloat16 *C, int M, int N, int K) {
