@@ -78,3 +78,4 @@ __device__ __forceinline__ void tcgen05_commit_group(uint64_t *bar) {
         :: "r"(mbar_ptr)
     );
 }
+ 
