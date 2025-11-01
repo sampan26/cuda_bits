@@ -15,6 +15,7 @@ module = torch.utils.cpp_extension.load(
         "-gencode=arch=compute_100a,code=sm_100a",  # Blackwell architecture
         "--ptxas-options=--gpu-name=sm_100a",
         "-O3",
+        "-w",
         "--use_fast_math",
         # "--ptxas-options=-v",
         # "-lineinfo",
@@ -33,7 +34,7 @@ A = torch.randn(M, K, dtype=dtype, device=device, requires_grad=False)
 B = torch.randn(N, K, dtype=dtype, device=device, requires_grad=False)
 
 output_ref = torch.matmul(A, B.T)
-# output_v1 = module.matmul_v1(A, B)
+output_v1 = module.matmul_v1(A, B)
 
 # torch.testing.assert_close(output_v1, output_ref)
 
