@@ -10,6 +10,18 @@ constexpr int WARP_THREADS = 32;
 constexpr int WARPGROUP_WARPS = 4;
 constexpr int WARPGROUP_THREADS = WARP_THREADS * WARPGROUP_WARPS;
 
+__forceinline__ __device__ uint32_t get_tmem_addr(uint32_t idx, int row_offset) {
+    int col_idx = 0x0000;
+    int row_idx = (idx >> 16) & 0xFFFF;
+    row_idx += row_offset;
+    col_idx = col_idx & 0xFFFF;
+    row_idx = row_idx & 0xFFFF;
+  
+    uint32_t new_idx = (row_idx << 16) | col_idx;
+    return new_idx;
+  }
+  
+
 template <int BlockMajorSize, int BlockMinorSize, int swizzle_bytes>
 __host__ static inline CUtensorMap create_tensor_map(const nv_bfloat16* gmem_ptr, int global_height, int global_width) {
     CUtensorMap tma_map;
@@ -39,8 +51,8 @@ CUtensorMap d_tma_map_B;
 
 template <int BM, int BN, int BK>
 struct SharedStorage {
-  alignas(128) nv_bfloat16 A[BM*BK];
-  alignas(128) nv_bfloat16 B[BK*BN];
+  alignas(256) nv_bfloat16 A[BM*BK];
+  alignas(256) nv_bfloat16 B[BK*BN];
 };
 
 template <int BM, int BN, int BK, int NUM_THREADS, int swizzle_elements>
@@ -64,6 +76,9 @@ matmul_kernel_v1(int M, int N, int K, nv_bfloat16* C,
     SharedStorage<BM, BN, BK> &s = *reinterpret_cast<SharedStorage<BM, BN, BK>*>(smem);
     nv_bfloat16 *sA = s.A;
     nv_bfloat16 *sB = s.B;
+
+    uint32_t sA_addr = static_cast<uint32_t>(__cvta_generic_to_shared(sA));
+    uint32_t sB_addr = static_cast<uint32_t>(__cvta_generic_to_shared(sB));
 
     __shared__ __align__(8) uint64_t tma_bar;
     __shared__ __align__(8) uint64_t mma_bar;
@@ -90,92 +105,87 @@ matmul_kernel_v1(int M, int N, int K, nv_bfloat16* C,
         if (tid == 0) {
             // load to tma
             expect_bytes(&tma_bar, (BK*BN+BK*BM)*sizeof(nv_bfloat16));
-            tma_load<swizzle_elements>(&sA[0], &tensorMapA, &tma_bar, k_tile*BK, tile_m*BM);
-            tma_load<swizzle_elements>(&sB[0], &tensorMapB, &tma_bar, k_tile*BK, tile_n*BN);
+            tma_load<swizzle_elements>(sA_addr, &tensorMapA, &tma_bar, k_tile*BK, tile_m*BM);
+            tma_load<swizzle_elements>(sB_addr, &tensorMapB, &tma_bar, k_tile*BK, tile_n*BN);
         }
-        constexpr uint32_t idesc = 
-            (0b00 << 0)              | // dense mma
-            (0b0 << 2)               | // no sparsity
-            (0b0 << 3)               | // no saturation
-            (0b01 << 4)              | // F32 Accum
-            (0b0 << 6)               | // Reserved
-            (0b001 << 7)             | // BF16 A dtype
-            (0b001 << 10)            | // BF16 B dtype
-            (0b0 << 13)              | // No Negation
-            (0b0 << 14)              | // No Negation
-            (0b0 << 15)              | // A K-Major
-            (0b1 << 16)              | // B K-Major
-            ((BN >> 3) << 17)        | // N, encoded
-            (0b0 << 23)              | // Reserved
-            ((BM >> 3) << 24)        | // M, encoded
-            (0b0 << 29)              | // Reserved
-            (0b00 << 30);              // No B reuse
 
-        uint64_t a_desc = 
-            (((static_cast<uint32_t>(__cvta_generic_to_shared(&sA[0])) & 0x3FFFF) >> 4) << 0) |
-            (0b00L << 14)                             |
-            (0x0L << 16)                              |
-            (((BK * sizeof(nv_bfloat16) & 0x3FFFF) >> 4) << 32)  |
-            (0b001L << 46)                   |
-            (0b000L << 49)                   |
-            (0b0L << 52)                     | 
-            (0b0000'0000L << 53)             | 
-            (0x6L << 61);                        
-            
-        uint64_t b_desc = 
-            (((static_cast<uint32_t>(__cvta_generic_to_shared(&sB[0])) & 0x3FFFF) >> 4) << 0) |
-            (0x0L << 16)                              |
-            ((((BK * BN * sizeof(nv_bfloat16)) & 0x3'FFFF) >> 4) << 32) |
-            (0b001L << 46)                            |
-            (0b000L << 49)                            |
-            (0b0L << 52)                              | 
-            (0b0000'0000L << 53)                      | 
-            (0x6L << 61);
-
-        // wait for tma_bar to complete
         wait(tma_bar, tma_phase_bit);
         tma_phase_bit ^= 1;
-        if (tid == 0) {
-            tcgen05_mma(tmem_addr, idesc, a_desc, b_desc);
-        }
+
+        constexpr uint32_t idesc =
+            (0b00  << 0)                 | // sparsity selector
+            (0b0   << 2)                 | // dense
+            (0b0   << 3)                 | // no saturate
+            (0b01  << 4)                 | // D (accum) type = F32
+            (0b0   << 6)                 | // reserved
+            (0b001 << 7)                 | // A type = BF16
+            (0b001 << 10)                | // B type = BF16
+            (0b0   << 13)                | // no negate A
+            (0b0   << 14)                | // no negate B
+            (0b0   << 15)                | // A: no transpose (K-major)
+            (0b0   << 16)                | // B: no transpose (K-major)
+            ((BN >> 3) << 17)            | // N field (6 bits)
+            (0b0   << 23)                | // reserved
+            ((BM >> 4) << 24)            | // M field (5 bits)  <<— FIXED
+            (0b0   << 29)                | // reserved
+            (0b00  << 30);                 // no B reuse shift
+
+        auto enc = [](uint32_t bytes) {
+            return (uint64_t)(((bytes & 0x3FFFF) >> 4)); // matrix-descriptor-encode
+        };
+        
         if (tid == 0) {
             asm volatile("tcgen05.fence::after_thread_sync;");
-
-            // for (int k = 0; k < BK / UMMA_K; ++k) {
-            //     a_desc += UMMA_K;
-            //     b_desc += UMMA_K;
-            // }
-
-        //     tcgen05_commit_group(&mma_bar);
-        }
+            int scale = 0;
+            for (int k = 0; k < BK / UMMA_K; ++k) {  
+                uint64_t a_desc =
+                    (( (static_cast<uint32_t>(__cvta_generic_to_shared(&sA[k*UMMA_K])) & 0x3FFFF) >> 4) << 0) |
+                    (0ULL << 16)                                   | // LD byte offset (unused for swizzled K-major)
+                    (enc(8 * BK * sizeof(nv_bfloat16)) << 32)      | // <<— FIXED: stride dimension (8 rows)
+                    (0b001ULL << 46)                                |
+                    (0ULL << 49)                                    | // base offset (see next section)
+                    (0ULL << 52)                                    | // LD mode: relative
+                    (0x0ULL  << 53)                                 | // fixed constant field per spec
+                    (0x6ULL  << 61);                                  // 32B swizzle
             
-            // 
-            //  // tgen05 mma commit
+                uint64_t b_desc =
+                    (( (static_cast<uint32_t>(__cvta_generic_to_shared(&sB[k*UMMA_K])) & 0x3FFFF) >> 4) << 0) |
+                    (0ULL << 16)                                   |
+                    (enc(8 * BK * sizeof(nv_bfloat16)) << 32)      | // <<— FIXED: same rationale
+                    (0b001ULL << 46)                                |
+                    (0ULL << 49)                                    |
+                    (0ULL << 52)                                    |
+                    (0x0ULL  << 53)                                 |
+                    (0x6ULL  << 61);
 
-            // wait(&mma_bar, mma_phase_bit);
-            // mma_phase_bit ^= 1;
-            // asm volatile("tcgen05.fence::before_thread_sync;\n");
-            // asm volatile("bar.sync 0;\n");
-            // asm volatile("tcgen05.fence::after_thread_sync;\n");
-            // asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
+                tcgen05_mma(tmem_addr, idesc, a_desc, b_desc, scale);
+                scale = 1;
+            }
+            tcgen05_commit_group(&mma_bar);
+        }
 
-    //         float tmp[32];
-    //         asm volatile("tcgen05.ld.sync.aligned.16x256b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-    //             : "=f"(tmp[0]), "=f"(tmp[1]), "=f"(tmp[2]), "=f"(tmp[3]),
-    //             "=f"(tmp[4]), "=f"(tmp[5]), "=f"(tmp[6]), "=f"(tmp[7]),
-    //             "=f"(tmp[8]), "=f"(tmp[9]), "=f"(tmp[10]), "=f"(tmp[11]),
-    //             "=f"(tmp[12]), "=f"(tmp[13]), "=f"(tmp[14]), "=f"(tmp[15]),
-    //             "=f"(tmp[16]), "=f"(tmp[17]), "=f"(tmp[18]), "=f"(tmp[19]),
-    //             "=f"(tmp[20]), "=f"(tmp[21]), "=f"(tmp[22]), "=f"(tmp[23]),
-    //             "=f"(tmp[24]), "=f"(tmp[25]), "=f"(tmp[26]), "=f"(tmp[27]),
-    //             "=f"(tmp[28]), "=f"(tmp[29]), "=f"(tmp[30]), "=f"(tmp[31])
-    //             : "r"(tmem_addr + (0 << 16) + (0))
-    //         );
-
-    //         //wait ld
-    //         asm volatile("tcgen05.wait::ld.sync.aligned;");
-        
+        wait(mma_bar, mma_phase_bit);
+        mma_phase_bit ^= 1;
     }
+
+    float tmp[2][32];
+    for (int r = 0; r < 2; ++r) {
+        asm volatile("tcgen05.ld.sync.aligned.16x256b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+            : "=f"(tmp[r][0]), "=f"(tmp[r][1]), "=f"(tmp[r][2]), "=f"(tmp[r][3]),
+            "=f"(tmp[r][4]), "=f"(tmp[r][5]), "=f"(tmp[r][6]), "=f"(tmp[r][7]),
+            "=f"(tmp[r][8]), "=f"(tmp[r][9]), "=f"(tmp[r][10]), "=f"(tmp[r][11]),
+            "=f"(tmp[r][12]), "=f"(tmp[r][13]), "=f"(tmp[r][14]), "=f"(tmp[r][15]),
+            "=f"(tmp[r][16]), "=f"(tmp[r][17]), "=f"(tmp[r][18]), "=f"(tmp[r][19]),
+            "=f"(tmp[r][20]), "=f"(tmp[r][21]), "=f"(tmp[r][22]), "=f"(tmp[r][23]),
+            "=f"(tmp[r][24]), "=f"(tmp[r][25]), "=f"(tmp[r][26]), "=f"(tmp[r][27]),
+            "=f"(tmp[r][28]), "=f"(tmp[r][29]), "=f"(tmp[r][30]), "=f"(tmp[r][31])
+            : "r"(get_tmem_addr(tmem_addr,  warp_id *32))
+        );
+    }
+    asm volatile("tcgen05.wait::ld.sync.aligned;");
+
+    
+
     if (warp_id == 0) { // must be performed by a single warp in the CTA
         asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
             :: "r"(tmem_addr), "r"(n_cols)
