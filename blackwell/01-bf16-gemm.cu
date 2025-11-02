@@ -33,15 +33,42 @@ __host__ static inline CUtensorMap create_tensor_map(const nv_bfloat16* gmem_ptr
         swizzle_bytes == 64  ? CU_TENSOR_MAP_SWIZZLE_64B  :
         swizzle_bytes == 128 ? CU_TENSOR_MAP_SWIZZLE_128B : 
                                CU_TENSOR_MAP_SWIZZLE_NONE;
-    uint64_t gmem_prob_shape[5] = {(uint64_t) swizzle_elements, (uint64_t) global_height, (uint64_t) global_width / swizzle_elements, 1, 1};
-    uint64_t gmem_prob_stride[5] = {(uint64_t) global_width * sizeof(nv_bfloat16), (uint64_t)swizzle_bytes * sizeof(nv_bfloat16), 0, 0, 0};
-    uint32_t smem_box_shape[5] = {(uint64_t)swizzle_elements, (uint64_t)(BlockMajorSize), (uint64_t)BlockMinorSize/swizzle_elements, 1, 1};
+    uint64_t gmem_prob_shape[5] = {
+        (uint64_t) swizzle_elements, 
+        (uint64_t) global_height, 
+        (uint64_t) global_width / swizzle_elements, 
+        1, 
+        1
+    };
+    uint64_t gmem_prob_stride[5] = {
+        (uint64_t) global_width * sizeof(nv_bfloat16), 
+        (uint64_t)swizzle_bytes,
+        (uint64_t) global_height * global_width * sizeof(nv_bfloat16), 
+        (uint64_t) global_height * global_width * sizeof(nv_bfloat16), 
+    };
+    uint32_t smem_box_shape[5] = {
+        (uint32_t)swizzle_elements, 
+        (uint32_t)BlockMajorSize, 
+        (uint32_t)BlockMinorSize/swizzle_elements, 
+        1, 
+        1
+    };
     uint32_t smem_box_stride[5] = {1, 1, 1, 1, 1};
 
     CUresult result = cuTensorMapEncodeTiled(
-        &tma_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 5, gmem_address, gmem_prob_shape,
-        gmem_prob_stride, smem_box_shape, smem_box_stride, CU_TENSOR_MAP_INTERLEAVE_NONE,
-        tma_swizzle, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+                            &tma_map, 
+                            CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 
+                            5, 
+                            gmem_address, 
+                            gmem_prob_shape,
+                            gmem_prob_stride, 
+                            smem_box_shape, 
+                            smem_box_stride, 
+                            CU_TENSOR_MAP_INTERLEAVE_NONE,
+                            tma_swizzle, 
+                            CU_TENSOR_MAP_L2_PROMOTION_NONE, 
+                            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+                        );
 
     assert(result == CUDA_SUCCESS);
     return tma_map;
@@ -78,9 +105,6 @@ matmul_kernel_v1(int M, int N, int K, nv_bfloat16* C,
     nv_bfloat16 *sA = s.A;
     nv_bfloat16 *sB = s.B;
 
-    uint32_t sA_addr = static_cast<uint32_t>(__cvta_generic_to_shared(sA));
-    uint32_t sB_addr = static_cast<uint32_t>(__cvta_generic_to_shared(sB));
-
     __shared__ __align__(8) uint64_t tma_bar;
     __shared__ __align__(8) uint64_t mma_bar;
     __shared__ __align__(8) uint32_t tmem_addr_shared;
@@ -89,6 +113,7 @@ matmul_kernel_v1(int M, int N, int K, nv_bfloat16* C,
         init_barriers(&tma_bar, 1);
         init_barriers(&mma_bar, 1);
     }
+    __syncthreads();
 
     uint32_t tmem_addr = 0;
     uint32_t n_cols = 512;
@@ -105,8 +130,8 @@ matmul_kernel_v1(int M, int N, int K, nv_bfloat16* C,
         if (tid == 0) {
             // load to tma
             expect_bytes(&tma_bar, (BK*BN+BK*BM)*sizeof(nv_bfloat16));
-            tma_load<swizzle_elements>(sA_addr, &tensorMapA, &tma_bar, k_tile*BK, tile_m*BM);
-            tma_load<swizzle_elements>(sB_addr, &tensorMapB, &tma_bar, k_tile*BK, tile_n*BN);
+            tma_load<swizzle_elements>(&sA[0], &tensorMapA, &tma_bar, k_tile*BK, tile_m*BM);
+            tma_load<swizzle_elements>(&sB[0], &tensorMapB, &tma_bar, k_tile*BK, tile_n*BN);
         }
 
         wait(tma_bar, tma_phase_bit);

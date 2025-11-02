@@ -10,9 +10,10 @@ __device__ static inline uint64_t matrix_descriptor_encode(uint64_t x) {
 }
 
 __device__ inline uint64_t make_smem_desc(nv_bfloat16* ptr) {
-    static constexpr int leading_dim_offset = 16;
+    static constexpr int leading_dim_offset = 1;
     static constexpr int stride_dim_offset = 1024;
     uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+    
     uint64_t desc = 0;
     desc |= matrix_descriptor_encode(addr);
     desc |= matrix_descriptor_encode((uint64_t)leading_dim_offset)  << 16;  
@@ -58,9 +59,10 @@ __device__ static __forceinline__ void wait(uint64_t& bar, int kPhaseBit) {
 
 // tma helpers
 template <int SWIZZLE_ELEMENTS>
-__device__ static inline void tma_load(uint32_t dst_ptr, void const* const src_tma_map, uint64_t* bar, int global_col_idx, int global_row_idx) {
+__device__ static inline void tma_load(nv_bfloat16* dst, void const* const src_tma_map, uint64_t* bar, int global_col_idx, int global_row_idx) {
     uint64_t tma_ptr  = reinterpret_cast<uint64_t>(src_tma_map);
     uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    uint32_t dst_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
 
     asm volatile (
         "cp.async.bulk.tensor.5d.shared::cta.global.tile.mbarrier::complete_tx::bytes.cta_group::1 "
