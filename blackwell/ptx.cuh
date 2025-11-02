@@ -10,6 +10,8 @@ __device__ static inline uint64_t matrix_descriptor_encode(uint64_t x) {
 }
 
 __device__ inline uint64_t make_smem_desc(nv_bfloat16* ptr) {
+    static constexpr int leading_dim_offset = 16;
+    static constexpr int stride_dim_offset = 1024;
     uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
     uint64_t desc = 0;
     desc |= matrix_descriptor_encode(addr);
@@ -19,7 +21,7 @@ __device__ inline uint64_t make_smem_desc(nv_bfloat16* ptr) {
     desc |= (0ULL << 49);
     desc |= (0ULL << 52);                                     // LD mode: relative
     desc |= (0x0ULL  << 53);                                  // fixed constant field per spec
-    desc |= (0x6ULL  << 61);                                  // 32B swizzle      
+    desc |= (0x2ULL  << 61);                                  // 32B swizzle      
     return desc;
 }
 
@@ -79,19 +81,32 @@ __device__ static __forceinline__ void tmem_alloc(uint32_t* dst_addr, int n_cols
     );
 }
 
-
-__device__ __forceinline__ void tcgen05_mma(uint32_t tm_addr, uint32_t i_desc, nv_bfloat16* sA, nv_bfloat16* sB, int scale) {
+template <bool init>
+__device__ __forceinline__ void tcgen05_mma(uint32_t tm_addr, uint32_t i_desc, nv_bfloat16* sA, nv_bfloat16* sB) {
     uint64_t a_desc = make_smem_desc(&sA[0]);
     uint64_t b_desc = make_smem_desc(&sB[0]);
-    asm volatile(
-        "{\n"
-        ".reg .pred p;\n"
-        "setp.eq.u32 p, 1, 0;\n"
-        "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, "
-        "{%5, %6, %7, %8}, p;\n"
-        "}\n"
-        :: "r"(tm_addr), "l"(a_desc), "l"(b_desc), "r"(i_desc), "r"(scale), "r"(0), "r"(0), "r"(0), "r"(0)
-    );
+    if (init) {
+        asm volatile(
+            "{\n"
+            ".reg .pred p;\n"
+            "setp.eq.u32 p, 1, 0;\n"
+            "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, "
+            "{%5, %6, %7, %8}, p;\n"
+            "}\n"
+            :: "r"(tm_addr), "l"(a_desc), "l"(b_desc), "r"(i_desc), "r"(0), "r"(0), "r"(0), "r"(0), "r"(0)
+        );
+    }
+    else {
+        asm volatile(
+            "{\n"
+            ".reg .pred p;\n"
+            "setp.eq.u32 p, 1, 1;\n"
+            "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, "
+            "{%5, %6, %7, %8}, p;\n"
+            "}\n"
+            :: "r"(tm_addr), "l"(a_desc), "l"(b_desc), "r"(i_desc), "r"(1), "r"(0), "r"(0), "r"(0), "r"(0)
+        );
+    }
 }
 
 __device__ __forceinline__ void tcgen05_commit_group(uint64_t *bar) {
