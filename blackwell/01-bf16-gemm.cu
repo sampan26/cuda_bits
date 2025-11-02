@@ -91,7 +91,7 @@ matmul_kernel_v1(int M, int N, int K, nv_bfloat16* C,
     }
 
     uint32_t tmem_addr = 0;
-    uint32_t n_cols = 32;
+    uint32_t n_cols = 512;
     if (warp_id == 0) {
         tmem_alloc(&tmem_addr_shared, n_cols);
     }
@@ -130,16 +130,11 @@ matmul_kernel_v1(int M, int N, int K, nv_bfloat16* C,
             (0b0   << 29)                | // reserved
             (0b00  << 30);                 // no B reuse shift
 
-        auto enc = [](uint32_t bytes) {
-            return (uint64_t)(((bytes & 0x3FFFF) >> 4)); // matrix-descriptor-encode
-        };
-        
         if (tid == 0) {
             asm volatile("tcgen05.fence::after_thread_sync;");
-            int scale = 0;
-            for (int k = 0; k < BK / UMMA_K; ++k) {  
-                tcgen05_mma(tmem_addr, idesc, sA[k*UMMA_K], sB[k*UMMA_K], scale);
-                scale = 1;
+            tcgen05_mma</* init =*/true>(tmem_addr, idesc, &sA[0], &sB[0]);
+            for (int k = 1; k < BK / UMMA_K; ++k) {  
+                tcgen05_mma<false>(tmem_addr, idesc, &sA[k*UMMA_K], &sB[k*UMMA_K]);
             }
             tcgen05_commit_group(&mma_bar);
         }
