@@ -148,16 +148,19 @@ matmul_kernel_v1(int M, int N, int K, nv_bfloat16* C,
             (0b0   << 13)                | // no negate A
             (0b0   << 14)                | // no negate B
             (0b0   << 15)                | // A: no transpose (K-major)
-            (0b1   << 16)                | // B: transpose
+            (0b0   << 16)                | // B: bo transpose (K-major) << - Keep!
             ((BN >> 3) << 17)            | // N field (6 bits)
             (0b0   << 23)                | // reserved
             ((BM >> 4) << 24)            | // M field (5 bits)  <<— FIXED
             (0b0   << 29)                | // reserved
             (0b00  << 30);                 // no B reuse shift
-
         if (tid == 0) {
             asm volatile("tcgen05.fence::after_thread_sync;");
-            tcgen05_mma</* init =*/true>(tmem_addr, idesc, &sA[0], &sB[0]);
+            if (k_tile == 0) {
+                tcgen05_mma</* init =*/true>(tmem_addr, idesc, &sA[0], &sB[0]);
+            } else {
+                tcgen05_mma</* init =*/false>(tmem_addr, idesc, &sA[0], &sB[0]);
+            }
             for (int k = 1; k < BK / UMMA_K; ++k) {  
                 tcgen05_mma<false>(tmem_addr, idesc, &sA[k*UMMA_K], &sB[k*UMMA_K]);
             }
