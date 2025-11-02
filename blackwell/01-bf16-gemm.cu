@@ -10,9 +10,10 @@ constexpr int WARP_THREADS = 32;
 constexpr int WARPGROUP_WARPS = 4;
 constexpr int WARPGROUP_THREADS = WARP_THREADS * WARPGROUP_WARPS;
 
-__forceinline__ __device__ uint32_t get_tmem_addr(uint32_t idx, int row_offset) {
-    int col_idx = 0x0000;
+__forceinline__ __device__ uint32_t get_tmem_addr(uint32_t idx, int row_offset, int col_offset) {
+    int col_idx = idx & 0xFFFF;
     int row_idx = (idx >> 16) & 0xFFFF;
+    col_idx += col_offset;
     row_idx += row_offset;
     col_idx = col_idx & 0xFFFF;
     row_idx = row_idx & 0xFFFF;
@@ -93,7 +94,6 @@ matmul_kernel_v1(int M, int N, int K, nv_bfloat16* C,
     uint32_t n_cols = 32;
     if (warp_id == 0) {
         tmem_alloc(&tmem_addr_shared, n_cols);
-        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
     __syncthreads();
     tmem_addr = tmem_addr_shared;
@@ -168,23 +168,22 @@ matmul_kernel_v1(int M, int N, int K, nv_bfloat16* C,
         mma_phase_bit ^= 1;
     }
 
-    float tmp[2][32];
-    for (int r = 0; r < 2; ++r) {
-        asm volatile("tcgen05.ld.sync.aligned.16x256b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-            : "=f"(tmp[r][0]), "=f"(tmp[r][1]), "=f"(tmp[r][2]), "=f"(tmp[r][3]),
-            "=f"(tmp[r][4]), "=f"(tmp[r][5]), "=f"(tmp[r][6]), "=f"(tmp[r][7]),
-            "=f"(tmp[r][8]), "=f"(tmp[r][9]), "=f"(tmp[r][10]), "=f"(tmp[r][11]),
-            "=f"(tmp[r][12]), "=f"(tmp[r][13]), "=f"(tmp[r][14]), "=f"(tmp[r][15]),
-            "=f"(tmp[r][16]), "=f"(tmp[r][17]), "=f"(tmp[r][18]), "=f"(tmp[r][19]),
-            "=f"(tmp[r][20]), "=f"(tmp[r][21]), "=f"(tmp[r][22]), "=f"(tmp[r][23]),
-            "=f"(tmp[r][24]), "=f"(tmp[r][25]), "=f"(tmp[r][26]), "=f"(tmp[r][27]),
-            "=f"(tmp[r][28]), "=f"(tmp[r][29]), "=f"(tmp[r][30]), "=f"(tmp[r][31])
-            : "r"(get_tmem_addr(tmem_addr,  warp_id *32))
-        );
+    nv_bfloat16 *block_C = C + tile_n*BN*M + tile_m*BM;
+    float tmp[128];
+    const int row = tid;
+    for (int c = 0; c < 128; ++c) {
+        asm volatile("tcgen05.ld.sync.aligned.32x32b.x1.b32 {%0}, [%1];\n"
+        : "=f"(tmp[c])
+        : "r"(get_tmem_addr(tmem_addr, tid/32 * 32, c)));
+
     }
     asm volatile("tcgen05.wait::ld.sync.aligned;");
 
-    
+    for (int c = 0; c < 128; ++c) {
+        #define IDX(i, j) (j*M + i)
+        block_C[IDX(row, c)] = __float2bfloat16(tmp[c]);
+        #undef IDX
+    }
 
     if (warp_id == 0) { // must be performed by a single warp in the CTA
         asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
