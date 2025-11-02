@@ -123,7 +123,7 @@ matmul_kernel_v1(int M, int N, int K, nv_bfloat16* C,
             (0b0   << 13)                | // no negate A
             (0b0   << 14)                | // no negate B
             (0b0   << 15)                | // A: no transpose (K-major)
-            (0b0   << 16)                | // B: no transpose (K-major)
+            (0b1   << 16)                | // B: transpose
             ((BN >> 3) << 17)            | // N field (6 bits)
             (0b0   << 23)                | // reserved
             ((BM >> 4) << 24)            | // M field (5 bits)  <<— FIXED
@@ -138,27 +138,7 @@ matmul_kernel_v1(int M, int N, int K, nv_bfloat16* C,
             asm volatile("tcgen05.fence::after_thread_sync;");
             int scale = 0;
             for (int k = 0; k < BK / UMMA_K; ++k) {  
-                uint64_t a_desc =
-                    (( (static_cast<uint32_t>(__cvta_generic_to_shared(&sA[k*UMMA_K])) & 0x3FFFF) >> 4) << 0) |
-                    (0ULL << 16)                                   | // LD byte offset (unused for swizzled K-major)
-                    (enc(8 * BK * sizeof(nv_bfloat16)) << 32)      | // <<— FIXED: stride dimension (8 rows)
-                    (0b001ULL << 46)                                |
-                    (0ULL << 49)                                    | // base offset (see next section)
-                    (0ULL << 52)                                    | // LD mode: relative
-                    (0x0ULL  << 53)                                 | // fixed constant field per spec
-                    (0x6ULL  << 61);                                  // 32B swizzle
-            
-                uint64_t b_desc =
-                    (( (static_cast<uint32_t>(__cvta_generic_to_shared(&sB[k*UMMA_K])) & 0x3FFFF) >> 4) << 0) |
-                    (0ULL << 16)                                   |
-                    (enc(8 * BK * sizeof(nv_bfloat16)) << 32)      | // <<— FIXED: same rationale
-                    (0b001ULL << 46)                                |
-                    (0ULL << 49)                                    |
-                    (0ULL << 52)                                    |
-                    (0x0ULL  << 53)                                 |
-                    (0x6ULL  << 61);
-
-                tcgen05_mma(tmem_addr, idesc, a_desc, b_desc, scale);
+                tcgen05_mma(tmem_addr, idesc, sA[k*UMMA_K], sB[k*UMMA_K], scale);
                 scale = 1;
             }
             tcgen05_commit_group(&mma_bar);

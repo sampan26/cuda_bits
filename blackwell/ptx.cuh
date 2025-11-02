@@ -4,6 +4,26 @@
 #include <cuda_bf16.h>
 #include <cuda/pipeline>  
 
+
+__device__ static inline uint64_t matrix_descriptor_encode(uint64_t x) {
+    return (((x) & 0x3FFFF) >> 0x4);
+}
+
+__device__ inline uint64_t make_smem_desc(nv_bfloat16* ptr) {
+    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+    uint64_t desc = 0;
+    desc |= matrix_descriptor_encode(addr);
+    desc |= matrix_descriptor_encode((uint64_t)leading_dim_offset)  << 16;  
+    desc |= matrix_descriptor_encode((uint64_t)stride_dim_offset)<< 32;  
+    desc |= (0b001ULL << 46);
+    desc |= (0ULL << 49);
+    desc |= (0ULL << 52);                                     // LD mode: relative
+    desc |= (0x0ULL  << 53);                                  // fixed constant field per spec
+    desc |= (0x6ULL  << 61);                                  // 32B swizzle      
+    return desc;
+}
+
+
 __device__ static __forceinline__ void init_barriers(uint64_t* bar, int count) {
     uint32_t bar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n"
@@ -60,7 +80,9 @@ __device__ static __forceinline__ void tmem_alloc(uint32_t* dst_addr, int n_cols
 }
 
 
-__device__ __forceinline__ void tcgen05_mma(uint32_t tm_addr, uint32_t i_desc, uint64_t a_desc, uint64_t b_desc, int scale) {
+__device__ __forceinline__ void tcgen05_mma(uint32_t tm_addr, uint32_t i_desc, nv_bfloat16* sA, nv_bfloat16* sB, int scale) {
+    uint64_t a_desc = make_smem_desc(&sA[0]);
+    uint64_t b_desc = make_smem_desc(&sB[0]);
     asm volatile(
         "{\n"
         ".reg .pred p;\n"
