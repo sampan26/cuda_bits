@@ -25,17 +25,22 @@ module = torch.utils.cpp_extension.load(
     verbose=True,
 )
 
-M, N, K = 8192, 8192, 8192
+M, N, K = 128, 128, 128
 
 dtype = torch.bfloat16
 device = 'cuda'
 
-A = torch.randn(M, K, dtype=dtype, device=device, requires_grad=False)
-B = torch.randn(N, K, dtype=dtype, device=device, requires_grad=False)
+A = torch.ones(M, K, dtype=dtype, device=device, requires_grad=False)
+B = torch.ones(N, K, dtype=dtype, device=device, requires_grad=False)
+
+A = torch.tril(A)
+B = torch.tril(B)
 
 output_ref = torch.matmul(A, B.T)
 output_v1 = module.matmul_v1(A, B)
 
+import pdb 
+breakpoint()
 # torch.testing.assert_close(output_v1, output_ref)
 
 print("Pytorch Matmul:", benchmark(torch.matmul, A, B.T))
