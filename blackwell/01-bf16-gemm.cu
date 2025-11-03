@@ -202,7 +202,7 @@ void matmul_v1(const nv_bfloat16 *A, const nv_bfloat16 *B, nv_bfloat16 *C, int M
     constexpr int BK = 64;
     constexpr int NUM_THREADS = 128;
 
-    constexpr int swizzle_bytes = 32;
+    constexpr int swizzle_bytes = 128;
     constexpr int swizzle_elements = swizzle_bytes / sizeof(nv_bfloat16);
 
     d_tma_map_A = create_tensor_map<BM, BK, swizzle_bytes>(A, M, K);

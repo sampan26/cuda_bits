@@ -10,8 +10,8 @@ __device__ static inline uint64_t matrix_descriptor_encode(uint64_t x) {
 }
 
 __device__ inline uint64_t make_smem_desc(nv_bfloat16* ptr) {
-    static constexpr int leading_dim_offset = 1;
-    static constexpr int stride_dim_offset = 64;
+    static constexpr int leading_dim_offset = 16;
+    static constexpr int stride_dim_offset = 1024;
     uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
     
     uint64_t desc = 0;
@@ -20,9 +20,9 @@ __device__ inline uint64_t make_smem_desc(nv_bfloat16* ptr) {
     desc |= matrix_descriptor_encode((uint64_t)stride_dim_offset)<< 32;  //matrix-descriptor-encode (Stride dimension byte offset)
     desc |= (0b001ULL << 46);                                 // Fixed constant value of 0b001
     desc |= (0ULL << 49);                                     // Matrix base offset
-    desc |= (0ULL << 52);                                     // LD mode: relative
+    desc |= (1ULL << 52);                                     // LD mode: relative
     desc |= (0x0ULL  << 53);                                  // fixed constant field per spec
-    desc |= (0x6ULL  << 61);                                  // 32B swizzle      
+    desc |= (0x2ULL  << 61);                                  // 32B swizzle      
     return desc;
 }
 
