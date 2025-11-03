@@ -171,7 +171,7 @@ matmul_kernel_v1(int M, int N, int K, nv_bfloat16* C,
         mma_phase_bit ^= 1;
     }
 
-    nv_bfloat16 *block_C = C + tile_n*BN*M + tile_m*BM;
+    nv_bfloat16 *block_C = C + tile_m*BM*N + tile_n*BN;
     float tmp[128];
     const int row = tid;
     for (int c = 0; c < 128; ++c) {
@@ -183,7 +183,7 @@ matmul_kernel_v1(int M, int N, int K, nv_bfloat16* C,
     asm volatile("tcgen05.wait::ld.sync.aligned;");
 
     for (int c = 0; c < 128; ++c) {
-        #define IDX(i, j) (j*M + i)
+        #define IDX(i, j) (i*N + j)
         block_C[IDX(row, c)] = __float2bfloat16(tmp[c]);
         #undef IDX
     }

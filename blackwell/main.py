@@ -25,22 +25,16 @@ module = torch.utils.cpp_extension.load(
     verbose=True,
 )
 
-M, N, K = 128, 128, 128
+M, N, K = 8192, 8192, 8192
 
 dtype = torch.bfloat16
 device = 'cuda'
 
-A = torch.randn(M, K, dtype=dtype, device=device, requires_grad=False)
-B = torch.randn(N, K, dtype=dtype, device=device, requires_grad=False)
-
-A = torch.tril(A)
-B = torch.tril(B)
+A = torch.randn(M, K, dtype=dtype, device=device)
+B = torch.randn(N, K, dtype=dtype, device=device)
 
 ref = torch.matmul(A, B.T)
 o = module.matmul_v1(A, B)
-
-import pdb
-breakpoint()
 
 torch.testing.assert_close(o, ref)
 
