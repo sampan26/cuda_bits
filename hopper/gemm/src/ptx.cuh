@@ -6,8 +6,6 @@
 
 using bf16 = __nv_bfloat16;
 
-namespace cde = cuda::device::experimental;
-
 // --- shared-mem matrix descriptor helpers -----------------------------------
 
 __device__ static inline uint64_t matrix_descriptor_encode(uint64_t x) {
